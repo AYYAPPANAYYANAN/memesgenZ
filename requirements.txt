@@ -1,0 +1,5 @@
+streamlit
+supabase
+requests
+pillow
+groq
