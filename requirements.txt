@@ -1,5 +1,8 @@
 streamlit
-supabase
 requests
-pillow
+Pillow
 groq
+duckduckgo-search
+opencv-python-headless
+numpy
+supabase
