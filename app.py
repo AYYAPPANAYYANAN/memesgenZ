@@ -1,677 +1,2021 @@
-import streamlit as st
-import requests
-import json
-import os
-import io
-import textwrap
-import random
-import urllib.parse
+"""
+MemeGen X — Enterprise AI Meme Studio
+Single-file full-stack Streamlit application.
+
+Install:
+    pip install streamlit groq pillow opencv-python numpy python-dotenv requests
+
+Optional:
+    pip install duckduckgo-search
+
+Run:
+    streamlit run app.py
+
+Environment:
+    GROQ_API_KEY=your_key
+
+Current Groq model choices used here:
+    MAIN_MODEL  = openai/gpt-oss-120b
+    FAST_MODEL  = openai/gpt-oss-20b
+    VISION_MODEL = qwen/qwen3.8-27b
+    SAFETY_MODEL = openai/gpt-oss-safeguard-20b
+    STT_MODEL   = whisper-large-v3-turbo
+
+The application is intentionally model-configurable so model IDs can be
+changed without rewriting the application.
+"""
+
+from __future__ import annotations
+
 import base64
+import io
+import json
+import math
+import os
+import re
+import sqlite3
 import time
-from PIL import Image, ImageDraw, ImageFont
-from groq import Groq
-from duckduckgo_search import DDGS
-import cv2
+import uuid
+import urllib.parse
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
 import numpy as np
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
-# --- 1. PAGE CONFIG (must be first Streamlit call) ---
-st.set_page_config(page_title="𝔪𝔢𝔪𝔢𝔰 𝔤𝔢𝔫𝔷", page_icon="🧙🏻‍♂", layout="wide")
-# --- 2. INITIALIZE ALL SESSION STATES ---
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
-# 🔐 Auth States
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-if "user_role" not in st.session_state:
-    st.session_state.user_role = "user"  # <--- THIS IS THE FIX! Defaults everyone to a standard user.
+try:
+    import requests
+except Exception:
+    requests = None
 
-# 🎨 Meme App States
-if "app_theme" not in st.session_state:
-    st.session_state.app_theme = "Cyber Blue"
-if "meme_history" not in st.session_state:
-    st.session_state.meme_history = []
-if "generated_caption" not in st.session_state:
-    st.session_state.generated_caption = None
-if "draft_text" not in st.session_state:
-    st.session_state.draft_text = ""
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 
-# --- 2.5 PROFESSIONAL SUPABASE AUTHENTICATION ---
-from supabase import create_client, Client
-import time
+# ============================================================================
+# CONFIG
+# ============================================================================
 
-# 1. Initialize Auth Session States Safely
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-if "user_role" not in st.session_state:
-    st.session_state.user_role = "user"
+st.set_page_config(
+    page_title="MemeGen X — AI Creative Studio",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# 2. Robust Client Initialization
-@st.cache_resource
-def get_supabase_client() -> Client:
-    """Initializes and caches the Supabase client."""
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
-    except KeyError as e:
-        st.error(f"🚨 Missing Secret: {e}. Check your .streamlit/secrets.toml file.")
-        st.stop()
-    except Exception as e:
-        st.error(f"🚨 Failed to initialize Supabase: {e}")
-        st.stop()
+APP_NAME = "MemeGen X"
+DB_PATH = Path("memegen_x.db")
+ASSET_DIR = Path("memegen_assets")
+ASSET_DIR.mkdir(exist_ok=True)
 
-def render_auth_page():
-    """Renders a production-ready authentication UI."""
-    st.markdown("<h2 style='text-align: center;'>⚡ Access the Vault</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #888;'>Authenticate to continue.</p>", unsafe_allow_html=True)
-    
-    supabase = get_supabase_client()
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        with st.container(border=True):
-            tab_login, tab_signup = st.tabs(["🔓 Log In", "📝 Sign Up"])
-            
-            # --- LOGIN TAB ---
-            with tab_login:
-                with st.form("pro_login_form"):
-                    email = st.text_input("Email", placeholder="you@domain.com")
-                    password = st.text_input("Password", type="password", placeholder="••••••••")
-                    submitted = st.form_submit_button("Log In", use_container_width=True)
-                    
-                    if submitted:
-                        if not email or not password:
-                            st.warning("⚠️ Please fill in both fields.")
-                        else:
-                            with st.spinner("Authenticating securely..."):
-                                try:
-                                    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-                                    st.session_state.logged_in = True
-                                    st.session_state.user_email = res.user.email
-                                    
-                                    # 👑 THE ADMIN HACK IS PROPERLY PLACED HERE!
-                                    # Change this email to your actual login email to get Admin access
-                                    if res.user.email == "ayyan@example.com":  
-                                        st.session_state.user_role = "admin"
-                                    else:
-                                        st.session_state.user_role = "user"
-                                        
-                                    st.success("✅ Access granted! Redirecting...")
-                                    time.sleep(1) # Smooth transition
-                                    st.rerun()
-                                except Exception as e:
-                                    error_msg = str(e).lower()
-                                    if "timeout" in error_msg or "ssl" in error_msg:
-                                        st.error("🚨 Network Timeout: Your internet or antivirus is blocking Supabase. Try a mobile hotspot!")
-                                    elif "invalid credentials" in error_msg:
-                                        st.error("🚫 Invalid email or password.")
-                                    else:
-                                        st.error(f"🚨 Auth Error: {e}")
+MAIN_MODEL = os.getenv("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b")
+FAST_MODEL = os.getenv("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b")
+VISION_MODEL = os.getenv("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b")
+SAFETY_MODEL = os.getenv("MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b")
+STT_MODEL = os.getenv("MEMEGEN_STT_MODEL", "whisper-large-v3-turbo")
 
-            # --- SIGN UP TAB ---
-            with tab_signup:
-                with st.form("pro_signup_form"):
-                    new_email = st.text_input("Email", placeholder="you@domain.com")
-                    new_password = st.text_input("Password", type="password", placeholder="Min 6 characters")
-                    signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
-                    
-                    if signup_submitted:
-                        if len(new_password) < 6:
-                            st.warning("⚠️ Password must be at least 6 characters.")
-                        elif not new_email:
-                            st.warning("⚠️ Email is required.")
-                        else:
-                            with st.spinner("Provisioning account..."):
-                                try:
-                                    res = supabase.auth.sign_up({"email": new_email, "password": new_password})
-                                    st.success("✅ Account created! You can now log in.")
-                                except Exception as e:
-                                    error_msg = str(e).lower()
-                                    if "timeout" in error_msg or "ssl" in error_msg:
-                                        st.error("🚨 Network Timeout: Your internet or antivirus is blocking Supabase.")
-                                    elif "already registered" in error_msg:
-                                        st.warning("⚠️ Email already exists. Try logging in.")
-                                    else:
-                                        st.error(f"🚨 Registration Error: {e}")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# 3. The Security Gate
-if not st.session_state.logged_in:
-    render_auth_page()
-    st.stop() # Prevents the rest of the app from running until authenticated
-# --- 3. DYNAMIC GEN Z THEME ENGINE ---
-theme_colors = {
-    "Neon Green (Default)": {"primary": "#ccff00", "secondary": "#00ffa3", "bg": "#160b24"},
-    "Cyber Blue":           {"primary": "#00f0ff", "secondary": "#0057ff", "bg": "#0a0b14"},
-    "Vaporwave Pink":       {"primary": "#ff00ff", "secondary": "#00ffff", "bg": "#1a0b2e"},
-    "Sunset Orange":        {"primary": "#ff4d00", "secondary": "#ffcc00", "bg": "#1c0d02"},
+if Groq and GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    groq_client = None
+
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db() -> None:
+    conn = db()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT,
+            role TEXT NOT NULL DEFAULT 'creator',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS memes (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            project_id TEXT,
+            prompt TEXT NOT NULL,
+            caption TEXT,
+            language TEXT,
+            tone TEXT,
+            template TEXT,
+            image_path TEXT,
+            model TEXT,
+            latency_ms INTEGER,
+            quality_score REAL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS evaluations (
+            id TEXT PRIMARY KEY,
+            meme_id TEXT NOT NULL,
+            relevance REAL,
+            humor REAL,
+            language REAL,
+            originality REAL,
+            visual REAL,
+            safety REAL,
+            overall REAL,
+            evaluator_model TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(meme_id) REFERENCES memes(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            event TEXT NOT NULL,
+            metadata TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ============================================================================
+# SESSION
+# ============================================================================
+
+defaults = {
+    "authenticated": False,
+    "user_id": None,
+    "email": None,
+    "role": "creator",
+    "page": "Create",
+    "prompt": "",
+    "language": "Tanglish",
+    "tone": "Savage",
+    "creativity": 0.78,
+    "last_result": None,
+    "history_refresh": 0,
+    "project": "Default Workspace",
 }
 
-colors = theme_colors[st.session_state.app_theme]
-p_color, s_color, bg_color = colors["primary"], colors["secondary"], colors["bg"]
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-st.markdown(f"""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800;900&display=swap');
 
-    .stApp {{
-        background: radial-gradient(circle at 10% 10%, {bg_color} 0%, #050505 100%);
-        color: #fafafa;
-        font-family: 'Outfit', sans-serif;
-    }}
-    h1, h2, h3 {{
-        font-family: 'Outfit', sans-serif !important;
-        font-weight: 900 !important;
-        background: linear-gradient(90deg, {p_color}, {s_color});
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-shadow: 0px 0px 15px {p_color}66;
-    }}
-    .stButton>button {{
-        background: linear-gradient(135deg, {p_color}, {s_color});
-        color: #000 !important;
-        font-weight: 800;
-        border-radius: 12px;
-        border: none;
-        transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-        box-shadow: 0 4px 15px {p_color}4D;
-    }}
-    .stButton>button:hover {{
-        transform: translateY(-3px) scale(1.02);
-        box-shadow: 0 10px 25px {p_color}99;
-    }}
-    section[data-testid="stSidebar"] {{
-        background-color: rgba(10, 11, 20, 0.6) !important;
-        backdrop-filter: blur(20px) !important;
-        -webkit-backdrop-filter: blur(20px) !important;
-        border-right: 1px solid rgba(255, 255, 255, 0.1) !important;
-        box-shadow: 5px 0 30px {p_color}33 !important;
-    }}
-    div[data-testid="stExpander"] {{
-        background: rgba(0, 0, 0, 0.4) !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-        border-radius: 16px !important;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
-        transition: all 0.3s ease;
-        margin-bottom: 10px;
-    }}
-    div[data-testid="stExpander"]:hover {{
-        border: 1px solid {p_color}80 !important;
-        box-shadow: 0 0 20px {p_color}4D !important;
-    }}
-    .meme-card {{
-        background: rgba(255, 255, 255, 0.03) !important;
-        backdrop-filter: blur(16px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 24px;
-        padding: 20px;
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-    }}
-    .meme-text {{
-        font-size: 24px;
-        font-weight: 800;
-        text-align: center;
-        background: linear-gradient(90deg, {p_color}, {s_color});
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }}
-    </style>
-""", unsafe_allow_html=True)
+# ============================================================================
+# UI
+# ============================================================================
 
-# --- 4. GROQ CLIENT SETUP ---
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-    client = Groq(api_key=GROQ_API_KEY)
-except Exception:
-    st.error("🚨 Missing Groq API Key! Check .streamlit/secrets.toml")
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+        :root {
+            --bg: #07080d;
+            --panel: rgba(17, 20, 30, .76);
+            --panel2: rgba(23, 27, 40, .86);
+            --line: rgba(255,255,255,.09);
+            --text: #f6f7fb;
+            --muted: #98a1b3;
+            --cyan: #38e8ff;
+            --purple: #8b5cf6;
+            --green: #47e3a5;
+        }
+
+        .stApp {
+            background:
+              radial-gradient(circle at 5% 0%, rgba(56,232,255,.10), transparent 28%),
+              radial-gradient(circle at 95% 5%, rgba(139,92,246,.12), transparent 30%),
+              linear-gradient(180deg, #07080d 0%, #0a0d14 100%);
+            color: var(--text);
+            font-family: Inter, sans-serif;
+        }
+
+        header[data-testid="stHeader"] { background: transparent; }
+        footer { visibility: hidden; }
+
+        .block-container {
+            max-width: 1500px;
+            padding-top: 1.5rem;
+            padding-bottom: 3rem;
+        }
+
+        h1,h2,h3,h4 {
+            font-family: "Space Grotesk", sans-serif !important;
+        }
+
+        .brand {
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 28px;
+            font-weight: 800;
+            letter-spacing: -.04em;
+        }
+
+        .gradient {
+            background: linear-gradient(90deg, #38e8ff, #8b5cf6, #ff4fd8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero {
+            padding: 26px 30px;
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            background:
+                radial-gradient(circle at 80% 20%, rgba(139,92,246,.20), transparent 35%),
+                linear-gradient(135deg, rgba(255,255,255,.045), rgba(255,255,255,.018));
+            box-shadow: 0 20px 80px rgba(0,0,0,.28);
+            margin-bottom: 20px;
+        }
+
+        .hero-title {
+            font-family: "Space Grotesk", sans-serif;
+            font-size: clamp(34px, 5vw, 62px);
+            line-height: .98;
+            font-weight: 800;
+            letter-spacing: -.055em;
+            margin-bottom: 12px;
+        }
+
+        .muted { color: var(--muted); }
+
+        .card {
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            background: var(--panel);
+            padding: 20px;
+            box-shadow: 0 15px 45px rgba(0,0,0,.18);
+            backdrop-filter: blur(18px);
+        }
+
+        .metric-card {
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: rgba(255,255,255,.035);
+            padding: 16px;
+        }
+
+        .metric-value {
+            font-size: 28px;
+            font-weight: 800;
+            font-family: "Space Grotesk", sans-serif;
+        }
+
+        .pill {
+            display:inline-block;
+            padding: 5px 10px;
+            border-radius: 999px;
+            background: rgba(56,232,255,.09);
+            border: 1px solid rgba(56,232,255,.20);
+            color: #aaf6ff;
+            font-size: 12px;
+            font-weight: 700;
+            margin-right: 5px;
+        }
+
+        .score-bar {
+            height: 8px;
+            border-radius: 99px;
+            background: rgba(255,255,255,.07);
+            overflow: hidden;
+            margin: 6px 0 13px;
+        }
+
+        .score-fill {
+            height:100%;
+            border-radius:99px;
+            background: linear-gradient(90deg,#38e8ff,#8b5cf6);
+        }
+
+        .stButton > button {
+            border-radius: 12px !important;
+            border: 1px solid rgba(255,255,255,.10) !important;
+            background: linear-gradient(135deg, rgba(56,232,255,.13), rgba(139,92,246,.15)) !important;
+            color: white !important;
+            font-weight: 700 !important;
+            transition: .2s ease;
+        }
+
+        .stButton > button:hover {
+            border-color: rgba(56,232,255,.45) !important;
+            transform: translateY(-1px);
+            box-shadow: 0 8px 28px rgba(56,232,255,.10);
+        }
+
+        textarea, input {
+            border-radius: 12px !important;
+        }
+
+        section[data-testid="stSidebar"] {
+            background: rgba(7,8,13,.82);
+            border-right: 1px solid var(--line);
+        }
+
+        div[data-testid="stMetric"] {
+            background: rgba(255,255,255,.025);
+            padding: 12px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+        }
+
+        .tiny {
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        .status {
+            display:flex;
+            align-items:center;
+            gap:8px;
+            color:#b9c2d0;
+            font-size:13px;
+        }
+
+        .dot {
+            width:8px;
+            height:8px;
+            border-radius:50%;
+            background:#47e3a5;
+            box-shadow:0 0 12px #47e3a5;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+inject_css()
+
+
+# ============================================================================
+# AUTH — lightweight local enterprise prototype auth
+# ============================================================================
+
+import hashlib
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def create_user(email: str, password: str) -> tuple[bool, str]:
+    email = email.strip().lower()
+    if len(password) < 8:
+        return False, "Password must contain at least 8 characters."
+
+    conn = db()
+    try:
+        uid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO users(id,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
+            (uid, email, hash_password(password), "creator", now()),
+        )
+        conn.execute(
+            "INSERT INTO projects(id,user_id,name,created_at) VALUES(?,?,?,?)",
+            (str(uuid.uuid4()), uid, "Default Workspace", now()),
+        )
+        conn.commit()
+        return True, "Account created."
+    except sqlite3.IntegrityError:
+        return False, "An account with that email already exists."
+    finally:
+        conn.close()
+
+
+def login_user(email: str, password: str) -> tuple[bool, str]:
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE email=? AND password_hash=?",
+        (email.strip().lower(), hash_password(password)),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return False, "Invalid email or password."
+
+    st.session_state.authenticated = True
+    st.session_state.user_id = row["id"]
+    st.session_state.email = row["email"]
+    st.session_state.role = row["role"]
+    return True, "Authenticated."
+
+
+def auth_page() -> None:
+    st.markdown(
+        """
+        <div style="max-width:900px;margin:8vh auto 0;">
+          <div class="hero">
+            <div class="pill">AI CREATIVE PLATFORM</div>
+            <div class="hero-title">Create memes with an <span class="gradient">AI creative engine.</span></div>
+            <div class="muted">
+              Multimodal generation, candidate ranking, computer vision layout,
+              quality evaluation and persistent workspace.
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    a, b, c = st.columns([1, 1.3, 1])
+    with b:
+        tab1, tab2 = st.tabs(["Sign in", "Create account"])
+
+        with tab1:
+            with st.form("login"):
+                email = st.text_input("Email", placeholder="you@company.com")
+                password = st.text_input("Password", type="password")
+                submit = st.form_submit_button("Enter workspace", use_container_width=True)
+                if submit:
+                    ok, msg = login_user(email, password)
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        with tab2:
+            with st.form("signup"):
+                email = st.text_input("Work email", placeholder="you@company.com")
+                password = st.text_input("Password", type="password")
+                password2 = st.text_input("Confirm password", type="password")
+                submit = st.form_submit_button("Create workspace", use_container_width=True)
+                if submit:
+                    if password != password2:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, msg = create_user(email, password)
+                        if ok:
+                            st.success(msg + " You can now sign in.")
+                        else:
+                            st.error(msg)
+
+
+if not st.session_state.authenticated:
+    auth_page()
     st.stop()
 
-# --- 5. TOP NAVIGATION ---
-st.markdown("<h1 style='text-align: center;'>🧙🏻‍♂ 𝔪𝔢𝔪𝔢𝔰 𝔤𝔢𝔫𝔷</h1>", unsafe_allow_html=True)
 
-# --- 6. SIDEBAR SETTINGS ---
-with st.sidebar:
-    # 1. Update greeting to use user_email
-    st.markdown(f"<h3 style='text-align: center;'>👋 Sup, {st.session_state.user_email}</h3>", unsafe_allow_html=True)
-    
-    # 2. Update logout button to clear user_email
-    if st.button("🚪 Log Out", use_container_width=True):
-        supabase = get_supabase_client() 
-        supabase.auth.sign_out() 
-        st.session_state.logged_in = False
-        st.session_state.user_email = None  # <-- Make sure this says user_email!
-        st.rerun()
-        
-    st.markdown("---")
-    st.markdown("<h2 style='text-align: center;'>⚙️ Workspace</h2>", unsafe_allow_html=True)
-    
-    # 👑 ADMIN ONLY SECTION
-    if st.session_state.user_role == "admin":
-        with st.expander("👑 Admin Dashboard", expanded=True):
-            st.warning("You have Admin privileges.")
-            st.metric("Total Memes Generated (Mock)", "420")
-            if st.button("Nuke Meme Vault (Global)"):
-                st.success("Vault Cleared!")
-    
-    # Standard User Settings
-    with st.expander("✨ App Appearance", expanded=True):
-        selected_theme = st.selectbox(
-            "UI Color Theme",
-            list(theme_colors.keys()),
-            index=list(theme_colors.keys()).index(st.session_state.app_theme),
-        )
-        if selected_theme != st.session_state.app_theme:
-            st.session_state.app_theme = selected_theme
-            st.rerun()
+# ============================================================================
+# HELPERS
+# ============================================================================
 
-    with st.expander("🎨 Graphics Preferences"):
-        meme_language = st.selectbox("🌐 Meme Language", ["Tanglish", "English", "German", "Hindi"])
-        meme_text_color = st.color_picker("Text Color", "#FFFFFF")
-# --- 7. UTILS ---
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def burn_meme_text(img: Image.Image, text: str, color: str, position="bottom") -> Image.Image:
-    """Burn meme caption text onto a PIL image dynamically dodging faces."""
-    img = img.convert("RGB")
-    draw = ImageDraw.Draw(img)
-    img_w, img_h = img.size
-    font_size = max(20, int(img_h / 10))
-    
+
+def log_event(event: str, metadata: dict[str, Any] | None = None) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO audit_logs(id,user_id,event,metadata,created_at) VALUES(?,?,?,?,?)",
+        (
+            str(uuid.uuid4()),
+            st.session_state.user_id,
+            event,
+            json.dumps(metadata or {}),
+            now(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def safe_json(text: str, default: dict[str, Any]) -> dict[str, Any]:
     try:
-        font = ImageFont.truetype("impact.ttf", font_size) # Pro-tip: Try changing arial.ttf to impact.ttf if you have it!
-    except IOError:
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            font = ImageFont.load_default()
-            
-    line_height = font_size + 10 if hasattr(font, 'getbbox') else 15
+        text = text.strip()
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.I).strip()
+        text = re.sub(r"```$", "", text).strip()
+        return json.loads(text)
+    except Exception:
+        return default
 
-    chars_per_line = max(10, int(img_w / (font_size * 0.6)))
-    lines = textwrap.wrap(text, width=chars_per_line)
-    total_text_height = line_height * len(lines)
-    
-    # 🔥 THE UPGRADE: Dynamic Y-Axis Placement
-    if position == "bottom":
-        y_text = img_h - total_text_height - 20
-        if y_text < 0: y_text = 10
-    else: # "top"
-        y_text = 20
+
+def b64_image(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+
+def get_font(size: int, bold: bool = True):
+    candidates = [
+        "Impact.ttf" if bold else "Arial.ttf",
+        "impact.ttf" if bold else "arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+# ============================================================================
+# AI LAYER
+# ============================================================================
+
+@dataclass
+class Candidate:
+    caption: str
+    hook: str = ""
+    template_hint: str = "reaction"
+    placement: str = "bottom"
+    rationale: str = ""
+
+
+@dataclass
+class Scores:
+    relevance: float
+    humor: float
+    language: float
+    originality: float
+    visual: float
+    safety: float
+    overall: float
+
+
+def ai_chat(
+    messages: list[dict[str, Any]],
+    model: str = MAIN_MODEL,
+    temperature: float = 0.7,
+    max_tokens: int = 1800,
+    reasoning_effort: str = "medium",
+    json_mode: bool = False,
+) -> str:
+    if not groq_client:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing. Add it to your environment before generating."
+        )
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_completion_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+    }
+
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = groq_client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content or ""
+
+
+def analyze_prompt(prompt: str, language: str, tone: str) -> dict[str, Any]:
+    system = """
+You are MemeGen X's intent-analysis engine.
+Convert a casual user situation into structured meme-generation intent.
+Return ONLY JSON.
+"""
+    user = f"""
+Situation: {prompt}
+Language: {language}
+Tone: {tone}
+
+Return:
+{{
+  "topic": "...",
+  "emotion": "...",
+  "audience": "...",
+  "style": "...",
+  "keywords": ["..."],
+  "visual_concept": "...",
+  "safety_risk": "low|medium|high"
+}}
+"""
+    try:
+        return safe_json(
+            ai_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                model=FAST_MODEL,
+                temperature=0.25,
+                max_tokens=700,
+                reasoning_effort="low",
+                json_mode=True,
+            ),
+            {
+                "topic": "general",
+                "emotion": "funny",
+                "audience": "internet",
+                "style": tone,
+                "keywords": [],
+                "visual_concept": "reaction meme",
+                "safety_risk": "low",
+            },
+        )
+    except Exception:
+        return {
+            "topic": prompt[:80],
+            "emotion": "funny",
+            "audience": "internet",
+            "style": tone,
+            "keywords": [],
+            "visual_concept": "reaction meme",
+            "safety_risk": "low",
+        }
+
+
+def generate_candidates(
+    prompt: str,
+    language: str,
+    tone: str,
+    creativity: float,
+    intent: dict[str, Any],
+) -> list[Candidate]:
+    language_rules = {
+        "Tanglish": "Use natural Tamil-English internet speech. Do not use formal literary Tamil.",
+        "English": "Use natural internet English.",
+        "Tamil": "Use natural conversational Tamil.",
+        "Hindi": "Use natural conversational Hindi.",
+        "German": "Use natural conversational German.",
+    }
+
+    system = f"""
+You are the primary creative reasoning engine for MemeGen X.
+Model role: generate high-quality, original meme candidates.
+
+Rules:
+- {language_rules.get(language, language_rules['English'])}
+- Tone: {tone}
+- Keep captions punchy and meme-native.
+- Avoid generic motivational language.
+- Avoid protected-person harassment, hateful content, threats or sexual exploitation.
+- Generate 6 genuinely different candidates.
+- Prefer cultural/contextual specificity.
+- Do not copy known meme captions verbatim.
+- Output ONLY JSON.
+"""
+
+    user = f"""
+User situation:
+{prompt}
+
+Structured intent:
+{json.dumps(intent, ensure_ascii=False)}
+
+Creativity:
+{creativity}
+
+Return:
+{{
+  "candidates": [
+    {{
+      "caption": "...",
+      "hook": "...",
+      "template_hint": "reaction|drake|top-bottom|office|college|coding|custom",
+      "placement": "top|bottom",
+      "rationale": "short reason"
+    }}
+  ]
+}}
+"""
+
+    raw = ai_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        model=MAIN_MODEL,
+        temperature=max(.25, min(1.0, creativity)),
+        max_tokens=1800,
+        reasoning_effort="high",
+        json_mode=True,
+    )
+
+    data = safe_json(raw, {"candidates": []})
+    output: list[Candidate] = []
+
+    for item in data.get("candidates", []):
+        caption = str(item.get("caption", "")).strip()
+        if caption:
+            output.append(
+                Candidate(
+                    caption=caption[:220],
+                    hook=str(item.get("hook", "")),
+                    template_hint=str(item.get("template_hint", "reaction")),
+                    placement=str(item.get("placement", "bottom")),
+                    rationale=str(item.get("rationale", "")),
+                )
+            )
+
+    return output[:6]
+
+
+def deterministic_ml_features(
+    prompt: str,
+    candidate: Candidate,
+    language: str,
+) -> dict[str, float]:
+    """
+    Lightweight local ML/ranking feature extractor.
+    This is intentionally deterministic and requires no GPU.
+    """
+
+    p = prompt.lower()
+    c = candidate.caption.lower()
+
+    p_words = set(re.findall(r"\b\w+\b", p))
+    c_words = set(re.findall(r"\b\w+\b", c))
+
+    overlap = len(p_words & c_words) / max(1, len(p_words))
+    length_quality = 1.0 - min(abs(len(c.split()) - 9) / 14, 1)
+
+    slang_terms = [
+        "bro", "vro", "pangu", "maapu", "da", "dei",
+        "lol", "bruh", "literally", "fr", "💀", "😂"
+    ]
+    slang_score = min(sum(1 for x in slang_terms if x in c) / 3, 1)
+
+    punch_score = min(
+        (c.count("!") * .10)
+        + (c.count("?") * .10)
+        + (c.count("💀") * .20)
+        + (c.count("😂") * .15)
+        + (0.15 if any(w in c for w in ["when", "me", "bro", "me:", "also"]) else 0),
+        1,
+    )
+
+    repetition_penalty = 0 if len(c_words) >= max(3, len(c.split()) * .55) else .25
+
+    language_bonus = slang_score if language == "Tanglish" else .65
+
+    return {
+        "semantic_overlap": min(overlap, 1),
+        "length_quality": max(0, length_quality),
+        "slang_fit": language_bonus,
+        "punch": min(punch_score, 1),
+        "repetition": repetition_penalty,
+    }
+
+
+def local_score(candidate: Candidate, prompt: str, language: str) -> Scores:
+    f = deterministic_ml_features(prompt, candidate, language)
+
+    relevance = (
+        .55 * f["semantic_overlap"]
+        + .25 * f["length_quality"]
+        + .20 * f["punch"]
+    )
+
+    humor = (
+        .45 * f["punch"]
+        + .30 * f["length_quality"]
+        + .25 * f["slang_fit"]
+    )
+
+    language_score = .72 + .28 * f["slang_fit"]
+
+    # Originality proxy:
+    # penalize repetitive structural patterns without pretending this is
+    # a semantic originality detector.
+    originality = max(
+        .45,
+        1.0 - f["repetition"] - (0.10 if candidate.caption.lower().startswith("when when") else 0),
+    )
+
+    visual = .55 + .45 * f["length_quality"]
+    safety = .98
+
+    overall = (
+        .30 * relevance
+        + .25 * humor
+        + .15 * language_score
+        + .15 * originality
+        + .10 * visual
+        + .05 * safety
+    )
+
+    return Scores(
+        relevance=round(relevance, 3),
+        humor=round(humor, 3),
+        language=round(language_score, 3),
+        originality=round(originality, 3),
+        visual=round(visual, 3),
+        safety=round(safety, 3),
+        overall=round(overall, 3),
+    )
+
+
+def ai_rerank(
+    prompt: str,
+    candidates: list[Candidate],
+    local_scores: list[Scores],
+) -> int:
+    """
+    Second-stage evaluator.
+    Uses GPT-OSS 120B to judge the shortlist after local feature ranking.
+    """
+    payload = []
+    for i, (c, s) in enumerate(zip(candidates, local_scores)):
+        payload.append(
+            {
+                "id": i,
+                "caption": c.caption,
+                "template": c.template_hint,
+                "local_score": asdict(s),
+            }
+        )
+
+    system = """
+You are a strict meme quality evaluator.
+Rank candidate captions by contextual relevance, humor, language naturalness,
+originality and visual usability.
+Do not reward offensive content.
+Return ONLY JSON.
+"""
+
+    user = f"""
+Situation:
+{prompt}
+
+Candidates:
+{json.dumps(payload, ensure_ascii=False)}
+
+Return:
+{{
+  "winner": 0,
+  "reason": "...",
+  "quality": 0.0
+}}
+"""
+
+    try:
+        result = safe_json(
+            ai_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                model=MAIN_MODEL,
+                temperature=.15,
+                max_tokens=500,
+                reasoning_effort="high",
+                json_mode=True,
+            ),
+            {"winner": 0, "quality": local_scores[0].overall, "reason": "local rank"},
+        )
+        idx = int(result.get("winner", 0))
+        return max(0, min(idx, len(candidates) - 1))
+    except Exception:
+        return int(np.argmax([x.overall for x in local_scores]))
+
+
+def safety_check(text: str) -> bool:
+    if not groq_client:
+        return True
+
+    try:
+        result = ai_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify whether the following meme caption is safe for a "
+                        "general consumer application. Return JSON with {\"safe\": true|false}."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            model=SAFETY_MODEL,
+            temperature=.0,
+            max_tokens=120,
+            reasoning_effort="low",
+            json_mode=True,
+        )
+        return bool(safe_json(result, {"safe": True}).get("safe", True))
+    except Exception:
+        return True
+
+
+def vision_analyze(image_bytes: bytes, instruction: str) -> dict[str, Any]:
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY is missing.")
+
+    encoded = b64_image(image_bytes)
+
+    response = groq_client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are the visual intelligence module of an AI meme studio. "
+                    "Analyze composition, subjects, emotions, OCR-like text, safe text "
+                    "zones and meme potential. Return only JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded}"
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=.4,
+        max_completion_tokens=1200,
+        reasoning_effort="medium",
+        response_format={"type": "json_object"},
+    )
+
+    return safe_json(
+        response.choices[0].message.content or "{}",
+        {
+            "description": "",
+            "emotion": "neutral",
+            "text_in_image": "",
+            "safe_zone": "bottom",
+            "meme_ideas": [],
+        },
+    )
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY is missing.")
+
+    response = groq_client.audio.transcriptions.create(
+        file=("voice.wav", audio_bytes),
+        model=STT_MODEL,
+        response_format="text",
+    )
+    return str(response)
+
+
+# ============================================================================
+# COMPUTER VISION / LAYOUT ENGINE
+# ============================================================================
+
+def detect_faces(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    if cv2 is None:
+        return []
+
+    arr = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+
+    if cascade.empty():
+        return []
+
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(40, 40),
+    )
+    return [tuple(map(int, f)) for f in faces]
+
+
+def choose_text_zone(image: Image.Image, preferred: str = "bottom") -> str:
+    faces = detect_faces(image)
+
+    if not faces:
+        return preferred if preferred in {"top", "bottom"} else "bottom"
+
+    largest = max(faces, key=lambda x: x[2] * x[3])
+    _, y, _, h = largest
+    center = y + h / 2
+
+    if center < image.height * .43:
+        return "bottom"
+    if center > image.height * .57:
+        return "top"
+
+    return preferred
+
+
+def wrap_text(draw, text: str, font, max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+
+    for word in words:
+        trial = word if not current else current + " " + word
+        box = draw.textbbox((0, 0), trial, font=font)
+        if box[2] - box[0] <= max_width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def burn_meme_text(
+    image: Image.Image,
+    text: str,
+    color: str = "#FFFFFF",
+    position: str = "bottom",
+) -> Image.Image:
+    img = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+
+    # Adaptive font-size search.
+    size = max(30, int(img.width * .075))
+    max_width = int(img.width * .90)
+
+    while size > 18:
+        font = get_font(size, True)
+        lines = wrap_text(draw, text, font, max_width)
+        if len(lines) <= 3:
+            break
+        size -= 2
+
+    font = get_font(size, True)
+    lines = wrap_text(draw, text, font, max_width)
+
+    spacing = max(5, int(size * .12))
+    heights = []
+    widths = []
 
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
-        text_w = bbox[2] - bbox[0]
-        x_text = (img_w - text_w) / 2
-        outline_range = max(1, int(font_size / 15))
-        
-        # Draw the thick black meme outline
-        for adj in range(-outline_range, outline_range + 1):
-            for op in range(-outline_range, outline_range + 1):
-                draw.text((x_text+adj, y_text+op), line, font=font, fill="black")
-                
-        # Draw the main text color
-        draw.text((x_text, y_text), line, font=font, fill=color)
-        y_text += line_height
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
+
+    total_h = sum(heights) + spacing * max(0, len(lines) - 1)
+
+    if position == "top":
+        y = int(img.height * .045)
+    else:
+        y = img.height - total_h - int(img.height * .055)
+
+    y = max(8, y)
+
+    outline = max(2, int(size * .055))
+
+    for i, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        w = bbox[2] - bbox[0]
+        x = (img.width - w) // 2
+
+        # Shadow/outline.
+        for dx in range(-outline, outline + 1):
+            for dy in range(-outline, outline + 1):
+                draw.text((x + dx, y + dy), line, font=font, fill="#000000")
+
+        draw.text((x, y), line, font=font, fill=color)
+        y += heights[i] + spacing
+
     return img
 
-from duckduckgo_search import DDGS
-import json
-import random
 
-def internet_meme_agent(situation: str, language: str) -> dict | None:
-    """An AI Agent with Graceful Degradation to handle 403 Rate Limits."""
-    ddgs = DDGS()
-    
-    # 🚨 THE EMERGENCY TAMIL VAULT (Used if DuckDuckGo blocks us)
-    # These are highly reliable direct Imgflip links to Kollywood legends
-    tamil_vault = {
-        "Vadivelu Confused/Thinking": "https://i.imgflip.com/49mcdq.jpg",
-        "Vadivelu Pain/Crying": "https://i.imgflip.com/38w1b8.jpg",
-        "Vadivelu Nesamani/Shock": "https://i.imgflip.com/32688u.jpg",
-        "Santhanam Mocking/Sarcasm": "https://i.imgflip.com/2xtw9m.jpg",
-        "Goundamani Angry/Tired": "https://i.imgflip.com/5zbncx.jpg",
-        "Drake (Fallback)": "https://i.imgflip.com/30b1gx.jpg"
-    }
-    
-    # --- STEP 1: Routing & Search Query Generation ---
-    router_prompt = f"""
-    Analyze this situation: "{situation}"
-    Target Language: {language}
-    
-    Generate two search queries:
-    1. A text query to find funny tweets/jokes about this topic in English.
-    2. An image search query to find a matching blank meme template. 
-       - IF Tanglish: Focus on Kollywood actors (e.g., "Vadivelu funny reaction blank", "Santhanam meme template").
-       
-    Output ONLY valid JSON: {{"text_query": "...", "image_query": "..."}}
-    """
-    
-    try:
-        # Ask Groq for search strategy
-        res1 = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": router_prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.3
-        )
-        queries = json.loads(res1.choices[0].message.content)
-        
-        # --- STEP 2: The Dangerous Web Scrape (with Try/Except) ---
-        internet_humor = ""
+def make_gradient_background(
+    width: int = 1080,
+    height: int = 1080,
+    seed: int = 42,
+) -> Image.Image:
+    rng = np.random.default_rng(seed)
+    y = np.linspace(0, 1, height)[:, None]
+    x = np.linspace(0, 1, width)[None, :]
+
+    r = (15 + 25 * x + 20 * y).astype(np.uint8)
+    g = (17 + 10 * x + 10 * y).astype(np.uint8)
+    b = (30 + 50 * (1 - x) + 25 * y).astype(np.uint8)
+
+    arr = np.stack(
+        [
+            np.broadcast_to(r, (height, width)),
+            np.broadcast_to(g, (height, width)),
+            np.broadcast_to(b, (height, width)),
+        ],
+        axis=-1,
+    )
+
+    # Subtle noise prevents a flat synthetic background.
+    noise = rng.normal(0, 2.0, arr.shape).astype(np.int16)
+    arr = np.clip(arr.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(arr)
+
+
+def render_meme(
+    image: Optional[Image.Image],
+    caption: str,
+    placement: str = "bottom",
+    text_color: str = "#FFFFFF",
+) -> Image.Image:
+    if image is None:
+        image = make_gradient_background()
+
+    img = image.convert("RGB")
+
+    # Standardize dimensions for consistent rendering.
+    target = 1080
+    ratio = target / max(img.width, img.height)
+    if ratio < 1:
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+
+    # Center-crop square.
+    side = min(img.width, img.height)
+    left = (img.width - side) // 2
+    top = (img.height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+
+    img = ImageEnhance.Contrast(img).enhance(1.04)
+    img = ImageEnhance.Sharpness(img).enhance(1.08)
+
+    zone = choose_text_zone(img, placement)
+    return burn_meme_text(img, caption, text_color, zone)
+
+
+# ============================================================================
+# PIPELINE
+# ============================================================================
+
+def generate_pipeline(
+    prompt: str,
+    language: str,
+    tone: str,
+    creativity: float,
+    image: Optional[Image.Image] = None,
+) -> dict[str, Any]:
+    start = time.perf_counter()
+
+    intent = analyze_prompt(prompt, language, tone)
+
+    if image is not None:
         try:
-            # Try to get jokes from DDG
-            text_results = ddgs.text(queries["text_query"], max_results=2)
-            internet_humor = " ".join([r['body'] for r in text_results]) if text_results else ""
-        except Exception:
-            internet_humor = "Rely on your own internal knowledge." # Fallback if text search 403s
-            
-        image_url = ""
-        used_fallback = False
-        try:
-            # Try to get image from DDG
-            image_results = ddgs.images(queries["image_query"], max_results=1)
-            image_url = image_results[0]['image'] if image_results else ""
-            if not image_url: raise ValueError("No image found")
-        except Exception:
-            # 🚨 403 RATE LIMIT CAUGHT: Fallback to Emergency Vault
-            used_fallback = True
-            # For Tanglish, pick a random Kollywood legend. Otherwise, fallback to a standard.
-            if language == "Tanglish":
-                image_url = random.choice(list(tamil_vault.values())[:-1]) # Exclude Drake
-            else:
-                image_url = tamil_vault["Drake (Fallback)"]
-
-        # --- STEP 3: Final Synthesis ---
-        tanglish_rules = """
-        CRITICAL TANGLISH RULES: 
-        - Use strict local Chennai/Madurai slang: Vro, pangu, maapu, sethaya, asingapattan, murugesa.
-        - NEVER use formal Tamil. Make it sound like a WhatsApp status.
-        - Example 1: "Code compile aagudha nu paaru... Illa azhuthuruven."
-        - Example 2: "Naan engineer aaven nu nenacha... IPdi aagitten."
-        """ if language == "Tanglish" else "Be unhinged and viral."
-
-        writer_prompt = f"""
-        You are an elite meme creator.
-        Situation: "{situation}"
-        Internet Inspiration: "{internet_humor}"
-        
-        {tanglish_rules}
-        
-        Write a hyper-relevant, savage caption (under 12 words) for the situation using the exact requested language ({language}).
-        Output ONLY valid JSON: {{"caption": "..."}}
-        """
-        
-        res2 = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": writer_prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.8
-        )
-        final_meme = json.loads(res2.choices[0].message.content)
-        
-        return {
-            "caption": final_meme["caption"],
-            "image_url": image_url,
-            "search_queries": queries,
-            "used_fallback": used_fallback
-        }
-        
-    except Exception as e:
-        st.error(f"Agent Pipeline Critical Error: {e}")
-        return None
-def generate_roast_from_vision(image_bytes, language):
-    """Sends image to Groq Vision model to get roasted."""
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    
-    tanglish_rules = """
-    Use strict local Chennai/Madurai slang: Vro, pangu, maapu.
-    NEVER use formal Tamil. Make it sound like a WhatsApp status.
-    """ if language == "Tanglish" else "Be unhinged and viral."
-    
-    prompt = f"""
-    Look at this image. You are a savage, Gen-Z meme creator.
-    Roast the contents of this image in a short, punchy meme caption (under 12 words).
-    Language/Style: {language}.
-    {tanglish_rules}
-    Output ONLY the raw caption text, no quotes, no JSON, just the roast text.
-    """
-      
-    try:
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct", # <--- UPDATED MODEL HERE
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                    ],
-                }
-            ],
-            temperature=0.8,
-            max_tokens=40
-        )
-        return response.choices[0].message.content.strip(' "')
-    except Exception as e:
-        st.error(f"Vision AI Failed: {e}")
-        return None
-def get_best_text_position(img: Image.Image) -> str:
-    """Uses OpenCV to detect faces and returns 'top' or 'bottom' for safe text placement."""
-    try:
-        # 1. Convert PIL image to OpenCV format
-        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-
-        # 2. Load OpenCV's built-in AI for face detection
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        
-        # 3. Scan the image for faces
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-
-        # If no face is found, default to the classic bottom text
-        if len(faces) == 0:
-            return "bottom"
-
-        # 4. Find the largest face
-        largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
-        x, y, w, h = largest_face
-        
-        # 5. Calculate center
-        face_center_y = y + (h / 2)
-        img_h = img.size[1]
-
-        # 6. If face is in bottom half, put text on top
-        if face_center_y > (img_h / 2):
-            return "top"
-        else:
-            return "bottom"
-            
-    except Exception as e:
-        print(f"Face detection failed: {e}")
-        return "bottom"
-
-# --- 8. MAIN UI ---
-
-main_col1, main_col2, main_col3 = st.columns([1, 2, 1])
-with main_col2:
-    st.markdown("<h3 style='text-align: center;'>🎙️ Conjure Comedy</h3>", unsafe_allow_html=True)
-
-    tab_classic, tab_vision = st.tabs(["📝 Classic Meme Generator", "📸 Roast My Face (Vision AI)"])
-
-  # TAB 1: CLASSIC
-    with tab_classic:
-        with st.container(border=True):
-            st.markdown("<p style='color: #888; font-size: 14px; font-weight: bold;'>1. Record situation (Optional)</p>", unsafe_allow_html=True)
-            audio_value = st.audio_input("Voice Input", label_visibility="collapsed")
-
-            if audio_value:
-                if st.button("⚡ Transcribe", key="transcribe_btn", use_container_width=True):
-                    with st.spinner("Decoding your voice..."):
-                        try:
-                            transcription = client.audio.transcriptions.create(
-                                file=("audio.wav", audio_value.read()),
-                                model="whisper-large-v3",
-                                response_format="text",
-                            )
-                            st.session_state.draft_text = transcription
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Transcription Error: {e}")
-
-            st.markdown("<p style='color: #888; font-size: 14px; font-weight: bold; margin-top: 15px;'>2. Type or Edit</p>", unsafe_allow_html=True)
-            prompt_input = st.text_area(
-                "Input",
-                value=st.session_state.draft_text,
-                placeholder="E.g., When you get a 9.53 GPA but your code still won't compile...",
-                height=80,
-                label_visibility="collapsed",
+            vision = vision_analyze(
+                image_bytes=image_to_bytes(image),
+                instruction=(
+                    "Analyze this image for meme generation. Identify the subjects, "
+                    "emotion, visible text, composition, likely safe caption zones, "
+                    "and three meme concepts."
+                ),
             )
-            if prompt_input != st.session_state.draft_text:
-                st.session_state.draft_text = prompt_input
+            intent["vision"] = vision
+        except Exception as exc:
+            intent["vision_error"] = str(exc)
 
-            st.markdown("<br>", unsafe_allow_html=True)
-            generate_btn = st.button("🧠 Auto-Generate Smart Meme", key="gen_smart_btn", use_container_width=True)
+    candidates = generate_candidates(
+        prompt=prompt,
+        language=language,
+        tone=tone,
+        creativity=creativity,
+        intent=intent,
+    )
 
-       # THE NEW SMART LOGIC TRIGGER
-        if generate_btn and prompt_input:
-            with st.spinner("Agent is searching the web for jokes and images..."):
-                
-                # Call our new advanced pipeline
-                result = internet_meme_agent(prompt_input, meme_language)
-                
-                if result and "caption" in result and "image_url" in result:
-                    caption = result["caption"]
-                    img_url = result["image_url"]
-                    
-                    #st.success(f"🎯 Web Search Used: {result['search_queries']['image_query']}")
-                    
-                # THE NEW SMART LOGIC TRIGGER
-        if generate_btn and prompt_input:
-            with st.spinner("Agent is searching the web for jokes and images..."):
-                
-                # Call our new advanced pipeline
-                result = internet_meme_agent(prompt_input, meme_language)
-                
-                if result and "caption" in result and "image_url" in result:
-                    caption = result["caption"]
-                    img_url = result["image_url"]
-                    
-                    st.success(f"🎯 Web Search Used: {result['search_queries']['image_query']}")
-                    
-                    try:
-                        # 1. Fetch the image from the web
-                        headers = {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                            'Accept': 'image/jpeg,image/png,image/webp,image/*;q=0.8'
-                        }
-                        img_res = requests.get(img_url, headers=headers, timeout=10)
-                        img_res.raise_for_status() 
-                        img = Image.open(io.BytesIO(img_res.content)).convert("RGB")
-                         
-                    except Exception:
-                        st.toast("⚠️ Template blocked! Forcing AI to draw it instead...", icon="✨")
-                        try:
-                            # 🚨 THE NEW AI IMAGE FALLBACK
-                            safe_prompt = urllib.parse.quote(f"A funny reaction meme background about: {prompt_input}, highly detailed, no text, no words")
-                            ai_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=800&height=800&nologo=true"
-                            
-                            ai_img_res = requests.get(ai_url, timeout=15)
-                            ai_img_res.raise_for_status()
-                            img = Image.open(io.BytesIO(ai_img_res.content)).convert("RGB")
-                            
-                        except Exception:
-                            # The absolute last resort if both the internet AND the AI fail
-                            st.toast("⚠️ AI generation also failed. Using a blank canvas.", icon="🚧")
-                            img = Image.new('RGB', (800, 800), color=(20, 20, 25))
-                    
-                    # 2. Burn the text onto whatever image we successfully got
-                    try:
-                        final_meme = burn_meme_text(img, caption, meme_text_color)
-                        
-                        # Display and Save
-                        st.image(final_meme, use_container_width=True)
-                        st.session_state.meme_history.append(
-                            {"image": final_meme, "caption": caption}
-                        )
-                    except Exception as e:
-                        st.error(f"Image Pipeline Error: {e}")
-    # TAB 2: VISION
-    with tab_vision:
-        with st.container(border=True):
-            upload_pic = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
-            camera_pic = st.camera_input("Take a Selfie", label_visibility="collapsed")
+    if not candidates:
+        raise RuntimeError("The AI returned no usable candidates.")
 
-            user_img_source = camera_pic if camera_pic else upload_pic
+    local_scores = [
+        local_score(c, prompt, language)
+        for c in candidates
+    ]
 
-            if user_img_source:
-                # 🔥 THE FIX: Use getvalue() so the image survives the button click!
-                img_bytes = user_img_source.getvalue() 
-                user_pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                st.image(user_pil_img, caption="Target Locked 🎯", use_container_width=True)
+    # First-stage ML ranking.
+    local_order = np.argsort(
+        [-s.overall for s in local_scores]
+    ).tolist()
 
-                if st.button("🔥 Roast This Image", key="roast_btn", use_container_width=True):
-                    with st.spinner("Scanning for emotional damage..."):
-                        
-                        roast_caption = generate_roast_from_vision(img_bytes, meme_language)
-                        
-                        if roast_caption:
-                            st.info(f"💬 AI Caption: '{roast_caption}'")
-                            
-                            # 1. Ask OpenCV where the face is
-                            safe_zone = get_best_text_position(user_pil_img)
-                            
-                            if safe_zone == "top":
-                                st.toast("🎯 Face detected at the bottom! Moving text to the top.", icon="⬆️")
-                            
-                            # 2. Tell the text burner where to put it
-                            final_roast = burn_meme_text(user_pil_img.copy(), roast_caption, meme_text_color, position=safe_zone)
-                            
-                            st.image(final_roast, use_container_width=True)
-                            
-                            # Save to vault
-                            st.session_state.meme_history.append({"image": final_roast, "caption": roast_caption})
-                            st.success("Roast complete!")
+    shortlist_idx = local_order[: min(4, len(local_order))]
+    shortlist = [candidates[i] for i in shortlist_idx]
+    shortlist_scores = [local_scores[i] for i in shortlist_idx]
 
-# --- 9. MEME VAULT ---
-st.markdown("---")
-col_title, col_clear = st.columns([4, 1], vertical_alignment="bottom")
-with col_title:
-    st.markdown("### 📜 Your Meme Vault")
-with col_clear:
-    if st.session_state.meme_history:
-        if st.button("🗑️ Clear Vault", use_container_width=True):
-            st.session_state.meme_history = []
+    # Second-stage reasoning evaluator.
+    winner_shortlist_idx = ai_rerank(prompt, shortlist, shortlist_scores)
+    winner_idx = shortlist_idx[winner_shortlist_idx]
+
+    winner = candidates[winner_idx]
+    winner_score = local_scores[winner_idx]
+
+    # Safety gate.
+    safe = safety_check(winner.caption)
+
+    if not safe:
+        safe_indices = [
+            i for i, c in enumerate(candidates)
+            if safety_check(c.caption)
+        ]
+        if safe_indices:
+            winner_idx = max(
+                safe_indices,
+                key=lambda i: local_scores[i].overall
+            )
+            winner = candidates[winner_idx]
+            winner_score = local_scores[winner_idx]
+
+    final_image = render_meme(
+        image=image,
+        caption=winner.caption,
+        placement=winner.placement,
+    )
+
+    latency = int((time.perf_counter() - start) * 1000)
+
+    return {
+        "intent": intent,
+        "candidates": candidates,
+        "scores": local_scores,
+        "winner": winner,
+        "winner_score": winner_score,
+        "image": final_image,
+        "latency_ms": latency,
+        "model": MAIN_MODEL,
+    }
+
+
+def image_to_bytes(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+# ============================================================================
+# PERSISTENCE
+# ============================================================================
+
+def save_meme(result: dict[str, Any], prompt: str, language: str, tone: str) -> str:
+    meme_id = str(uuid.uuid4())
+    image_path = ASSET_DIR / f"{meme_id}.png"
+    result["image"].save(image_path, format="PNG", optimize=True)
+
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO memes(
+            id,user_id,project_id,prompt,caption,language,tone,template,
+            image_path,model,latency_ms,quality_score,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            meme_id,
+            st.session_state.user_id,
+            None,
+            prompt,
+            result["winner"].caption,
+            language,
+            tone,
+            result["winner"].template_hint,
+            str(image_path),
+            result["model"],
+            result["latency_ms"],
+            result["winner_score"].overall,
+            now(),
+        ),
+    )
+
+    s = result["winner_score"]
+    conn.execute(
+        """
+        INSERT INTO evaluations(
+            id,meme_id,relevance,humor,language,originality,
+            visual,safety,overall,evaluator_model,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            str(uuid.uuid4()),
+            meme_id,
+            s.relevance,
+            s.humor,
+            s.language,
+            s.originality,
+            s.visual,
+            s.safety,
+            s.overall,
+            MAIN_MODEL,
+            now(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+    log_event(
+        "meme.generated",
+        {
+            "meme_id": meme_id,
+            "model": MAIN_MODEL,
+            "latency_ms": result["latency_ms"],
+            "quality": s.overall,
+        },
+    )
+
+    return meme_id
+
+
+def history() -> list[sqlite3.Row]:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT m.*, e.relevance, e.humor, e.language AS language_score,
+               e.originality, e.visual, e.safety, e.overall
+        FROM memes m
+        LEFT JOIN evaluations e ON e.meme_id=m.id
+        WHERE m.user_id=?
+        ORDER BY m.created_at DESC
+        LIMIT 100
+        """,
+        (st.session_state.user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ============================================================================
+# SIDEBAR
+# ============================================================================
+
+with st.sidebar:
+    st.markdown('<div class="brand">⚡ <span class="gradient">MemeGen X</span></div>', unsafe_allow_html=True)
+    st.caption("Enterprise AI Creative Studio")
+
+    st.markdown(
+        f"""
+        <div class="status">
+          <span class="dot"></span>
+          {st.session_state.email}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    pages = ["Create", "Vision Roast", "Vault", "Analytics", "AI Lab", "Settings"]
+    for p in pages:
+        if st.button(
+            p,
+            use_container_width=True,
+            type="primary" if st.session_state.page == p else "secondary",
+        ):
+            st.session_state.page = p
             st.rerun()
 
-if not st.session_state.meme_history:
-    st.info("Your vault is empty! Generate memes and they'll appear here.")
-else:
-    history_cols = st.columns(3)
-    for index, past_meme in enumerate(reversed(st.session_state.meme_history)):
-        original_index = len(st.session_state.meme_history) - 1 - index
-        with history_cols[index % 3]:
-            with st.container(border=True):
-                st.image(past_meme["image"], use_container_width=True)
-                st.markdown(f"<div style='font-style: italic; font-size: 14px; margin-top: 10px;'>&quot;{past_meme['caption']}&quot;</div>", unsafe_allow_html=True)
-                
-                buf = io.BytesIO()
-                past_meme["image"].save(buf, format="PNG")
+    st.markdown("---")
+    st.markdown("### AI Stack")
+    st.caption(f"Reasoning: `{MAIN_MODEL}`")
+    st.caption(f"Fast: `{FAST_MODEL}`")
+    st.caption(f"Vision: `{VISION_MODEL}`")
+    st.caption(f"Safety: `{SAFETY_MODEL}`")
+    st.caption(f"STT: `{STT_MODEL}`")
+
+    st.markdown("---")
+    if st.button("Log out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.user_id = None
+        st.session_state.email = None
+        st.rerun()
+
+
+# ============================================================================
+# TOP HEADER
+# ============================================================================
+
+st.markdown(
+    f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+      <div>
+        <div class="tiny">WORKSPACE / {st.session_state.page.upper()}</div>
+        <div class="brand">AI Creative Studio</div>
+      </div>
+      <div class="pill">● AI ONLINE</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================================
+# CREATE
+# ============================================================================
+
+if st.session_state.page == "Create":
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">MULTIMODAL MEME ENGINE</div>
+          <div class="hero-title">Turn a situation into a <span class="gradient">high-signal meme.</span></div>
+          <div class="muted">
+            GPT-OSS reasoning → candidate generation → ML ranking → AI evaluation →
+            computer-vision layout → final render.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, center, right = st.columns([1.05, 1.55, .95], gap="large")
+
+    with left:
+        st.markdown("### Creative brief")
+
+        prompt = st.text_area(
+            "Situation",
+            value=st.session_state.prompt,
+            height=160,
+            placeholder=(
+                "Example: When your code works perfectly on your laptop "
+                "but crashes during the demo..."
+            ),
+            label_visibility="collapsed",
+        )
+        st.session_state.prompt = prompt
+
+        c1, c2 = st.columns(2)
+        with c1:
+            language = st.selectbox(
+                "Language",
+                ["Tanglish", "English", "Tamil", "Hindi", "German"],
+                index=["Tanglish", "English", "Tamil", "Hindi", "German"].index(
+                    st.session_state.language
+                ),
+            )
+        with c2:
+            tone = st.selectbox(
+                "Tone",
+                ["Savage", "Wholesome", "Sarcastic", "Chaotic", "Corporate", "Dry"],
+                index=["Savage", "Wholesome", "Sarcastic", "Chaotic", "Corporate", "Dry"].index(
+                    st.session_state.tone
+                ),
+            )
+
+        st.session_state.language = language
+        st.session_state.tone = tone
+
+        creativity = st.slider(
+            "Creativity",
+            0.1,
+            1.0,
+            float(st.session_state.creativity),
+            .01,
+        )
+        st.session_state.creativity = creativity
+
+        uploaded = st.file_uploader(
+            "Optional image",
+            type=["png", "jpg", "jpeg", "webp"],
+        )
+
+        source_image = None
+        if uploaded:
+            source_image = Image.open(uploaded).convert("RGB")
+            st.image(source_image, caption="Reference image", use_container_width=True)
+
+        voice = st.audio_input("Or speak your situation")
+
+        if voice and st.button("Transcribe voice", use_container_width=True):
+            with st.spinner("Transcribing..."):
+                try:
+                    text = transcribe_audio(voice.getvalue())
+                    st.session_state.prompt = text
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        st.markdown("---")
+
+        generate = st.button(
+            "⚡ Generate enterprise-quality meme",
+            use_container_width=True,
+            type="primary",
+        )
+
+    with center:
+        st.markdown("### Live canvas")
+
+        if generate:
+            if not prompt.strip():
+                st.warning("Describe the situation first.")
+            elif not groq_client:
+                st.error("GROQ_API_KEY is not configured.")
+            else:
+                with st.spinner("Running multimodal creative pipeline..."):
+                    try:
+                        result = generate_pipeline(
+                            prompt=prompt,
+                            language=language,
+                            tone=tone,
+                            creativity=creativity,
+                            image=source_image,
+                        )
+                        meme_id = save_meme(result, prompt, language, tone)
+                        result["meme_id"] = meme_id
+                        st.session_state.last_result = result
+                        st.success(f"Generated in {result['latency_ms']} ms")
+                    except Exception as exc:
+                        st.error(f"Generation failed: {exc}")
+
+        result = st.session_state.last_result
+
+        if result:
+            st.image(result["image"], use_container_width=True)
+
+            caption = result["winner"].caption
+            st.markdown(
+                f"""
+                <div class="card">
+                  <div class="tiny">SELECTED CAPTION</div>
+                  <div style="font-size:20px;font-weight:800;margin-top:5px;">
+                    {caption}
+                  </div>
+                  <div class="tiny" style="margin-top:10px;">
+                    {result["winner"].rationale}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            buf = io.BytesIO()
+            result["image"].save(buf, format="PNG")
+
+            d1, d2 = st.columns(2)
+            with d1:
                 st.download_button(
-                    label="⬇️ Download",
-                    data=buf.getvalue(),
-                    file_name=f"memegenz_{original_index}.png",
+                    "Download PNG",
+                    buf.getvalue(),
+                    file_name="memegen_x.png",
                     mime="image/png",
                     use_container_width=True,
-                    key=f"dl_{original_index}",
                 )
-                
-                viral_message = f"Bro look at this meme I made! 😂\n\n\"{past_meme['caption']}\""
-                encoded_message = urllib.parse.quote(viral_message)
-                st.markdown(f'<a href="https://wa.me/?text={encoded_message}" target="_blank" style="display: block; text-align: center; background-color: #25D366; color: white; padding: 6px; border-radius: 8px; text-decoration: none; font-weight: bold; margin-top: 5px;">🟢 Share on WhatsApp</a>', unsafe_allow_html=True)
-                
-                if st.button("❌ Remove", key=f"del_{original_index}", use_container_width=True):
-                    st.session_state.meme_history.pop(original_index)
-                    st.rerun()
+            with d2:
+                msg = urllib.parse.quote(
+                    f"{caption}\n\nCreated with MemeGen X"
+                )
+                st.link_button(
+                    "Share",
+                    f"https://wa.me/?text={msg}",
+                    use_container_width=True,
+                )
+        else:
+            st.markdown(
+                """
+                <div class="card" style="height:520px;display:flex;align-items:center;justify-content:center;text-align:center;">
+                  <div>
+                    <div style="font-size:70px;">🧠</div>
+                    <h2>Creative canvas</h2>
+                    <div class="muted">
+                      Your ranked AI-generated meme will appear here.
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with right:
+        st.markdown("### AI Copilot")
+
+        if result:
+            score = result["winner_score"]
+
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                  <div class="tiny">OVERALL QUALITY</div>
+                  <div class="metric-value">{score.overall*100:.1f}%</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            score_items = [
+                ("Relevance", score.relevance),
+                ("Humor", score.humor),
+                ("Language", score.language),
+                ("Originality", score.originality),
+                ("Visual fit", score.visual),
+                ("Safety", score.safety),
+            ]
+
+            for label, value in score_items:
+                st.markdown(
+                    f"""
+                    <div style="font-size:13px;margin-top:12px;">
+                      <div style="display:flex;justify-content:space-between;">
+                        <span>{label}</span><b>{value*100:.0f}%</b>
+                      </div>
+                      <div class="score-bar">
+                        <div class="score-fill" style="width:{value*100:.1f}%"></div>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("#### Pipeline")
+
+            for item in [
+                "Intent extraction",
+                "Candidate generation",
+                "Local feature ranking",
+                "GPT-OSS quality evaluation",
+                "Safety gate",
+                "CV layout optimization",
+            ]:
+                st.markdown(f"✓ {item}")
+
+            st.markdown("#### Candidates")
+
+            for i, (cand, score) in enumerate(
+                zip(result["candidates"], result["scores"]), start=1
+            ):
+                with st.expander(
+                    f"{i}. {score.overall*100:.0f}% — {cand.caption[:48]}"
+                ):
+                    st.write(cand.caption)
+                    st.caption(cand.rationale)
+
+        else:
+            st.info("Generate a meme to see model reasoning and quality signals.")
+
+
+# ============================================================================
+# VISION
+# ============================================================================
+
+elif st.session_state.page == "Vision Roast":
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">VISION AI</div>
+          <div class="hero-title">Upload an image. Let the <span class="gradient">vision engine</span> understand it.</div>
+          <div class="muted">Qwen multimodal analysis + OCR/context extraction + CV layout.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    upload = st.file_uploader(
+        "Upload image",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="vision_upload",
+    )
+
+    if upload:
+        image = Image.open(upload).convert("RGB")
+
+        a, b = st.columns(2)
+        with a:
+            st.image(image, use_container_width=True)
+
+        with b:
+            instruction = st.text_area(
+                "Vision instruction",
+                "Analyze this image for meme potential and identify the safest caption zone.",
+            )
+
+            if st.button("Analyze with Vision AI", type="primary", use_container_width=True):
+                if not groq_client:
+                    st.error("GROQ_API_KEY is not configured.")
+                else:
+                    with st.spinner("Running vision model..."):
+                        try:
+                            vision = vision_analyze(
+                                image_to_bytes(image),
+                                instruction,
+                            )
+                            st.session_state["vision_result"] = vision
+                        except Exception as exc:
+                            st.error(str(exc))
+
+        vision = st.session_state.get("vision_result")
+
+        if vision:
+            st.markdown("### Vision intelligence")
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric("Emotion", str(vision.get("emotion", "—")))
+            c2.metric("Safe zone", str(vision.get("safe_zone", "—")))
+            c3.metric("Text", "Detected" if vision.get("text_in_image") else "None")
+            c4.metric("Model", "Qwen 3.8 27B")
+
+            st.json(vision)
+
+            if st.button("🔥 Generate roast from this image", type="primary"):
+                prompt = (
+                    f"Create a short meme caption for this image. "
+                    f"Visual analysis: {json.dumps(vision)}"
+                )
+                with st.spinner("Creating ranked roast..."):
+                    try:
+                        result = generate_pipeline(
+                            prompt,
+                            st.session_state.language,
+                            st.session_state.tone,
+                            st.session_state.creativity,
+                            image,
+                        )
+                        save_meme(
+                            result,
+                            prompt,
+                            st.session_state.language,
+                            st.session_state.tone,
+                        )
+                        st.session_state.last_result = result
+                        st.image(result["image"], use_container_width=True)
+                        st.success(result["winner"].caption)
+                    except Exception as exc:
+                        st.error(str(exc))
+
+
+# ============================================================================
+# VAULT
+# ============================================================================
+
+elif st.session_state.page == "Vault":
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">MEME VAULT</div>
+          <div class="hero-title">Your generated <span class="gradient">creative history.</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    rows = history()
+
+    if not rows:
+        st.info("No generated memes yet.")
+    else:
+        for row in rows:
+            with st.container():
+                c1, c2 = st.columns([1.1, 1])
+
+                with c1:
+                    path = Path(row["image_path"])
+                    if path.exists():
+                        st.image(str(path), use_container_width=True)
+
+                with c2:
+                    st.markdown(f"### {row['caption']}")
+                    st.caption(
+                        f"{row['language']} · {row['tone']} · "
+                        f"{row['model']} · {row['latency_ms']} ms"
+                    )
+
+                    cols = st.columns(3)
+                    cols[0].metric("Quality", f"{(row['overall'] or 0)*100:.0f}%")
+                    cols[1].metric("Humor", f"{(row['humor'] or 0)*100:.0f}%")
+                    cols[2].metric("Relevance", f"{(row['relevance'] or 0)*100:.0f}%")
+
+                st.divider()
+
+
+# ============================================================================
+# ANALYTICS
+# ============================================================================
+
+elif st.session_state.page == "Analytics":
+    rows = history()
+
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">AI OBSERVABILITY</div>
+          <div class="hero-title">Creative system <span class="gradient">analytics.</span></div>
+          <div class="muted">Track quality, latency and generation volume.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    total = len(rows)
+    avg_quality = (
+        sum((r["overall"] or 0) for r in rows) / total
+        if total else 0
+    )
+    avg_latency = (
+        sum((r["latency_ms"] or 0) for r in rows) / total
+        if total else 0
+    )
+
+    a, b, c, d = st.columns(4)
+    a.metric("Generations", total)
+    b.metric("Avg quality", f"{avg_quality*100:.1f}%")
+    c.metric("Avg latency", f"{avg_latency:.0f} ms")
+    d.metric("AI model", "GPT-OSS 120B")
+
+    if rows:
+        st.markdown("### Quality distribution")
+
+        chart = []
+        for r in rows:
+            chart.append(
+                {
+                    "quality": float(r["overall"] or 0),
+                    "humor": float(r["humor"] or 0),
+                    "relevance": float(r["relevance"] or 0),
+                    "originality": float(r["originality"] or 0),
+                }
+            )
+
+        st.bar_chart(chart)
+
+
+# ============================================================================
+# AI LAB
+# ============================================================================
+
+elif st.session_state.page == "AI Lab":
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">MODEL LAB</div>
+          <div class="hero-title">Inspect the <span class="gradient">AI architecture.</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Active model registry")
+
+    registry = [
+        {
+            "role": "Primary reasoning",
+            "model": MAIN_MODEL,
+            "status": "Production",
+            "purpose": "Candidate generation, evaluation, reasoning",
+        },
+        {
+            "role": "Fast router",
+            "model": FAST_MODEL,
+            "status": "Production",
+            "purpose": "Intent classification and lightweight tasks",
+        },
+        {
+            "role": "Vision",
+            "model": VISION_MODEL,
+            "status": "Preview",
+            "purpose": "Image understanding, OCR and visual QA",
+        },
+        {
+            "role": "Safety",
+            "model": SAFETY_MODEL,
+            "status": "Preview",
+            "purpose": "Policy/safety classification",
+        },
+        {
+            "role": "Speech",
+            "model": STT_MODEL,
+            "status": "Production",
+            "purpose": "Voice transcription",
+        },
+    ]
+
+    st.dataframe(registry, use_container_width=True, hide_index=True)
+
+    st.markdown("### Ranking algorithm")
+
+    st.code(
+        """
+overall =
+    0.30 * relevance
+  + 0.25 * humor
+  + 0.15 * language
+  + 0.15 * originality
+  + 0.10 * visual_fit
+  + 0.05 * safety
+
+Pipeline:
+prompt
+  -> intent extraction
+  -> 6 candidate generation
+  -> deterministic feature extraction
+  -> local ML-style ranking
+  -> top-4 shortlist
+  -> GPT-OSS 120B evaluator
+  -> safety gate
+  -> computer-vision layout
+  -> final image
+        """,
+        language="text",
+    )
+
+    st.info(
+        "The local scorer is a transparent heuristic/ranking layer, not a "
+        "pretend-trained neural network. For a real enterprise deployment, "
+        "replace it with a learned ranker trained on user feedback and evaluation labels."
+    )
+
+
+# ============================================================================
+# SETTINGS
+# ============================================================================
+
+elif st.session_state.page == "Settings":
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="pill">WORKSPACE SETTINGS</div>
+          <div class="hero-title">Control your <span class="gradient">AI studio.</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Model configuration")
+
+    st.code(
+        f"""
+MEMEGEN_MAIN_MODEL={MAIN_MODEL}
+MEMEGEN_FAST_MODEL={FAST_MODEL}
+MEMEGEN_VISION_MODEL={VISION_MODEL}
+MEMEGEN_SAFETY_MODEL={SAFETY_MODEL}
+MEMEGEN_STT_MODEL={STT_MODEL}
+        """.strip(),
+        language="bash",
+    )
+
+    st.markdown("### Product controls")
+
+    new_tone = st.selectbox(
+        "Default tone",
+        ["Savage", "Wholesome", "Sarcastic", "Chaotic", "Corporate", "Dry"],
+        index=["Savage", "Wholesome", "Sarcastic", "Chaotic", "Corporate", "Dry"].index(
+            st.session_state.tone
+        ),
+    )
+
+    if st.button("Save defaults"):
+        st.session_state.tone = new_tone
+        st.success("Workspace defaults updated.")
+
+    st.markdown("### Security")
+
+    st.info(
+        "For public deployment, move authentication to Supabase/Auth0/enterprise SSO, "
+        "use PostgreSQL with row-level security, store images in object storage, "
+        "put API calls behind a backend service, add rate limiting and secrets management."
+    )
+
+    st.markdown("### Audit")
+
+    conn = db()
+    logs = conn.execute(
+        """
+        SELECT event, metadata, created_at
+        FROM audit_logs
+        WHERE user_id=?
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        (st.session_state.user_id,),
+    ).fetchall()
+    conn.close()
+
+    if logs:
+        st.dataframe(
+            [
+                {
+                    "event": x["event"],
+                    "metadata": x["metadata"],
+                    "created_at": x["created_at"],
+                }
+                for x in logs
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No audit events yet.")
