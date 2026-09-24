@@ -11,8 +11,12 @@ Optional:
 Run:
     streamlit run app.py
 
-Environment:
-    GROQ_API_KEY=your_key
+Streamlit Cloud Secrets:
+    SUPABASE_URL = "https://almmvgiimkftvgdsiiko.supabase.co"
+    SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."
+    GROQ_API_KEY = "gsk_..."
+
+Environment variables are also supported locally.
 
 Current Groq model choices used here:
     MAIN_MODEL  = openai/gpt-oss-120b
@@ -67,6 +71,11 @@ try:
 except Exception:
     pass
 
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
 
 # ============================================================================
 # CONFIG
@@ -81,21 +90,68 @@ st.set_page_config(
 
 APP_NAME = "MemeGen X"
 DB_PATH = Path("memegen_x.db")
+
+def secret(name: str, default: str = "") -> str:
+    """Read Streamlit Cloud Secrets first, then environment variables."""
+    try:
+        value = st.secrets.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+SUPABASE_URL = secret(
+    "SUPABASE_URL",
+    "https://almmvgiimkftvgdsiiko.supabase.co",
+)
+# Preferred current Supabase key. Also accepts legacy anon key for compatibility.
+SUPABASE_PUBLISHABLE_KEY = secret(
+    "SUPABASE_PUBLISHABLE_KEY",
+    secret("SUPABASE_ANON_KEY", ""),
+)
+SUPABASE_SECRET_KEY = secret("SUPABASE_SECRET_KEY", "")
+
 ASSET_DIR = Path("memegen_assets")
 ASSET_DIR.mkdir(exist_ok=True)
 
-MAIN_MODEL = os.getenv("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b")
-FAST_MODEL = os.getenv("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b")
-VISION_MODEL = os.getenv("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b")
-SAFETY_MODEL = os.getenv("MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b")
-STT_MODEL = os.getenv("MEMEGEN_STT_MODEL", "whisper-large-v3-turbo")
+MAIN_MODEL = secret("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b")
+FAST_MODEL = secret("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b")
+VISION_MODEL = secret("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b")
+SAFETY_MODEL = secret("MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b")
+STT_MODEL = secret("MEMEGEN_STT_MODEL", "whisper-large-v3-turbo")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY = secret("GROQ_API_KEY", "")
 
 if Groq and GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
 else:
     groq_client = None
+
+@st.cache_resource
+def get_supabase_client():
+    if create_client is None:
+        return None
+
+    # Browser/client-safe key. Never use the sb_secret key in this user path.
+    key = SUPABASE_PUBLISHABLE_KEY
+    if not SUPABASE_URL or not key:
+        return None
+
+    try:
+        return create_client(SUPABASE_URL, key)
+    except Exception:
+        return None
+
+supabase_client = get_supabase_client()
+
+SUPABASE_READY = bool(
+    create_client is not None
+    and SUPABASE_URL
+    and SUPABASE_PUBLISHABLE_KEY
+    and supabase_client is not None
+)
 
 
 # ============================================================================
@@ -390,56 +446,111 @@ inject_css()
 
 
 # ============================================================================
-# AUTH — lightweight local enterprise prototype auth
+# AUTH — Supabase Auth
 # ============================================================================
 
-import hashlib
-
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def create_user(email: str, password: str) -> tuple[bool, str]:
+    """Create the user in Supabase Auth.
+
+    Passwords are handled by Supabase Auth. We deliberately do not hash or
+    store user passwords in the local SQLite database.
+    """
     email = email.strip().lower()
+
+    if not email or "@" not in email:
+        return False, "Enter a valid email address."
+
     if len(password) < 8:
         return False, "Password must contain at least 8 characters."
 
-    conn = db()
-    try:
-        uid = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO users(id,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-            (uid, email, hash_password(password), "creator", now()),
+    if supabase_client is None:
+        return False, (
+            "Supabase is not configured. Check SUPABASE_URL and "
+            "SUPABASE_PUBLISHABLE_KEY in Streamlit Secrets."
         )
+
+    try:
+        result = supabase_client.auth.sign_up(
+            {"email": email, "password": password}
+        )
+
+        if not result.user:
+            return False, "Supabase did not create the account."
+
+        uid = str(result.user.id)
+
+        # Local cache only — never store the password.
+        conn = db()
         conn.execute(
-            "INSERT INTO projects(id,user_id,name,created_at) VALUES(?,?,?,?)",
-            (str(uuid.uuid4()), uid, "Default Workspace", now()),
+            """INSERT OR IGNORE INTO users
+               (id, email, password_hash, role, created_at)
+               VALUES (?, ?, NULL, ?, ?)""",
+            (uid, email, "creator", now()),
         )
         conn.commit()
-        return True, "Account created."
-    except sqlite3.IntegrityError:
-        return False, "An account with that email already exists."
-    finally:
         conn.close()
+
+        if result.session:
+            st.session_state.authenticated = True
+            st.session_state.user_id = uid
+            st.session_state.email = email
+            st.session_state.role = "creator"
+            return True, "Account created and signed in."
+
+        return True, (
+            "Account created. Check your email to confirm the account, "
+            "then sign in."
+        )
+
+    except Exception as exc:
+        return False, f"Supabase signup failed: {exc}"
 
 
 def login_user(email: str, password: str) -> tuple[bool, str]:
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM users WHERE email=? AND password_hash=?",
-        (email.strip().lower(), hash_password(password)),
-    ).fetchone()
-    conn.close()
+    email = email.strip().lower()
 
-    if not row:
-        return False, "Invalid email or password."
+    if not email or not password:
+        return False, "Enter your email and password."
 
-    st.session_state.authenticated = True
-    st.session_state.user_id = row["id"]
-    st.session_state.email = row["email"]
-    st.session_state.role = row["role"]
-    return True, "Authenticated."
+    if supabase_client is None:
+        return False, (
+            "Supabase is not configured. Check SUPABASE_URL and "
+            "SUPABASE_PUBLISHABLE_KEY in Streamlit Secrets."
+        )
+
+    try:
+        result = supabase_client.auth.sign_in_with_password(
+            {"email": email, "password": password}
+        )
+
+        if not result.user:
+            return False, "Invalid email or password."
+
+        uid = str(result.user.id)
+
+        conn = db()
+        conn.execute(
+            """INSERT OR IGNORE INTO users
+               (id, email, password_hash, role, created_at)
+               VALUES (?, ?, NULL, ?, ?)""",
+            (uid, email, "creator", now()),
+        )
+        conn.commit()
+        conn.close()
+
+        st.session_state.authenticated = True
+        st.session_state.user_id = uid
+        st.session_state.email = email
+        st.session_state.role = "creator"
+
+        return True, "Authenticated with Supabase."
+
+    except Exception as exc:
+        return False, f"Supabase login failed: {exc}"
 
 
 def auth_page() -> None:
@@ -467,7 +578,9 @@ def auth_page() -> None:
             with st.form("login"):
                 email = st.text_input("Email", placeholder="you@company.com")
                 password = st.text_input("Password", type="password")
-                submit = st.form_submit_button("Enter workspace", use_container_width=True)
+                submit = st.form_submit_button(
+                    "Enter workspace", use_container_width=True
+                )
                 if submit:
                     ok, msg = login_user(email, password)
                     if ok:
@@ -477,17 +590,23 @@ def auth_page() -> None:
 
         with tab2:
             with st.form("signup"):
-                email = st.text_input("Work email", placeholder="you@company.com")
+                email = st.text_input(
+                    "Work email", placeholder="you@company.com"
+                )
                 password = st.text_input("Password", type="password")
-                password2 = st.text_input("Confirm password", type="password")
-                submit = st.form_submit_button("Create workspace", use_container_width=True)
+                password2 = st.text_input(
+                    "Confirm password", type="password"
+                )
+                submit = st.form_submit_button(
+                    "Create workspace", use_container_width=True
+                )
                 if submit:
                     if password != password2:
                         st.error("Passwords do not match.")
                     else:
                         ok, msg = create_user(email, password)
                         if ok:
-                            st.success(msg + " You can now sign in.")
+                            st.success(msg)
                         else:
                             st.error(msg)
 
@@ -500,10 +619,6 @@ if not st.session_state.authenticated:
 # ============================================================================
 # HELPERS
 # ============================================================================
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 
 def log_event(event: str, metadata: dict[str, Any] | None = None) -> None:
     conn = db()
@@ -1270,6 +1385,33 @@ def image_to_bytes(image: Image.Image) -> bytes:
 
 
 # ============================================================================
+# SUPABASE CLOUD STORAGE
+# ============================================================================
+
+def supabase_upload_image(local_path: Path, object_name: str) -> Optional[str]:
+    """Upload to a Supabase Storage bucket named `memes`.
+    The bucket should be configured in the Supabase dashboard.
+    """
+    if supabase_client is None:
+        return None
+
+    try:
+        with local_path.open("rb") as f:
+            supabase_client.storage.from_("memes").upload(
+                object_name,
+                f.read(),
+                {"content-type": "image/png", "upsert": "true"},
+            )
+        try:
+            return supabase_client.storage.from_("memes").get_public_url(object_name)
+        except Exception:
+            return None
+    except Exception as exc:
+        log_event("storage.upload_failed", {"error": str(exc)})
+        return None
+
+
+# ============================================================================
 # PERSISTENCE
 # ============================================================================
 
@@ -1277,6 +1419,11 @@ def save_meme(result: dict[str, Any], prompt: str, language: str, tone: str) -> 
     meme_id = str(uuid.uuid4())
     image_path = ASSET_DIR / f"{meme_id}.png"
     result["image"].save(image_path, format="PNG", optimize=True)
+
+    cloud_url = supabase_upload_image(
+        image_path,
+        f"{st.session_state.user_id}/{meme_id}.png",
+    )
 
     conn = db()
     conn.execute(
@@ -1336,6 +1483,7 @@ def save_meme(result: dict[str, Any], prompt: str, language: str, tone: str) -> 
             "model": MAIN_MODEL,
             "latency_ms": result["latency_ms"],
             "quality": s.overall,
+            "cloud_storage": bool(cloud_url),
         },
     )
 
@@ -1391,6 +1539,12 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
+    st.markdown("### Cloud")
+    if supabase_client is not None:
+        st.markdown('<div class="status"><span class="dot"></span> Supabase connected</div>', unsafe_allow_html=True)
+    else:
+        st.caption("Supabase key not configured.")
+
     st.markdown("### AI Stack")
     st.caption(f"Reasoning: `{MAIN_MODEL}`")
     st.caption(f"Fast: `{FAST_MODEL}`")
@@ -1952,6 +2106,18 @@ elif st.session_state.page == "Settings":
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+    st.markdown("### Supabase configuration")
+    st.code(
+        f"""SUPABASE_URL={SUPABASE_URL}
+SUPABASE_PUBLISHABLE_KEY=<your sb_publishable_... key>
+SUPABASE_SECRET_KEY=<server-only sb_secret_... key>""",
+        language="bash",
+    )
+    st.caption(
+        "Use the publishable key for this Streamlit user path with RLS. "
+        "Keep the secret key server-only and never commit it."
     )
 
     st.markdown("### Model configuration")
