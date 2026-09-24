@@ -1331,25 +1331,35 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 # ============================================================================
 
 def detect_faces(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Best-effort face detection; never makes meme generation fail.
+
+    OpenCV is optional. Some 2026 OpenCV builds/environments expose different
+    APIs, so we explicitly verify every symbol before using it.
+    """
     if cv2 is None:
         return []
 
-    arr = np.array(image.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+    cascade_cls = getattr(cv2, "CascadeClassifier", None)
+    data_obj = getattr(cv2, "data", None)
+    haar_dir = getattr(data_obj, "haarcascades", None) if data_obj is not None else None
+    cvt_color = getattr(cv2, "cvtColor", None)
+    color_rgb2gray = getattr(cv2, "COLOR_RGB2GRAY", None)
 
-    if cascade.empty():
+    if not all((cascade_cls, haar_dir, cvt_color, color_rgb2gray)):
         return []
 
-    faces = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(40, 40),
-    )
-    return [tuple(map(int, f)) for f in faces]
+    try:
+        arr = np.array(image.convert("RGB"))
+        gray = cvt_color(arr, color_rgb2gray)
+        cascade = cascade_cls(str(Path(haar_dir) / "haarcascade_frontalface_default.xml"))
+        if cascade is None or getattr(cascade, "empty", lambda: True)():
+            return []
+        faces = cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+        )
+        return [tuple(map(int, f)) for f in faces]
+    except Exception:
+        return []
 
 
 def choose_text_zone(image: Image.Image, preferred: str = "bottom") -> str:
@@ -1454,29 +1464,114 @@ def make_gradient_background(
     width: int = 1080,
     height: int = 1080,
     seed: int = 42,
+    prompt: str = "",
+    style: str = "chaotic",
 ) -> Image.Image:
-    rng = np.random.default_rng(seed)
+    """Unlimited, local, zero-API image generator for meme backgrounds.
+
+    This is deliberately procedural rather than pretending to be a hosted
+    text-to-image model. It uses Pillow/NumPy only, so every generation is free
+    after installation and has no image API quota.
+    """
+    import hashlib
+    from PIL import ImageChops
+
+    digest = hashlib.sha256(f"{prompt}|{style}|{seed}".encode("utf-8")).digest()
+    rng = np.random.default_rng(int.from_bytes(digest[:8], "big"))
+
+    palettes = {
+        "chaotic": ((10, 12, 28), (76, 20, 110), (15, 120, 160)),
+        "cyber": ((5, 12, 24), (0, 90, 150), (110, 25, 150)),
+        "comic": ((30, 18, 10), (150, 45, 30), (230, 170, 35)),
+        "office": ((18, 22, 28), (65, 75, 90), (120, 130, 145)),
+        "college": ((16, 30, 26), (25, 105, 85), (70, 150, 130)),
+    }
+    c1, c2, c3 = palettes.get(style.lower(), palettes["chaotic"])
+
     y = np.linspace(0, 1, height)[:, None]
     x = np.linspace(0, 1, width)[None, :]
-
-    r = (15 + 25 * x + 20 * y).astype(np.uint8)
-    g = (17 + 10 * x + 10 * y).astype(np.uint8)
-    b = (30 + 50 * (1 - x) + 25 * y).astype(np.uint8)
-
-    arr = np.stack(
-        [
-            np.broadcast_to(r, (height, width)),
-            np.broadcast_to(g, (height, width)),
-            np.broadcast_to(b, (height, width)),
-        ],
-        axis=-1,
+    w1 = (1 - x) * (1 - y)
+    w2 = x * (1 - y)
+    w3 = y
+    arr = (
+        w1[..., None] * np.array(c1)
+        + w2[..., None] * np.array(c2)
+        + w3[..., None] * np.array(c3)
     )
-
-    # Subtle noise prevents a flat synthetic background.
-    noise = rng.normal(0, 2.0, arr.shape).astype(np.int16)
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    noise = rng.normal(0, 3.2, arr.shape).astype(np.int16)
     arr = np.clip(arr.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr, "RGB").convert("RGBA")
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay, "RGBA")
 
-    return Image.fromarray(arr)
+    # Large soft-ish neon blobs (multiple translucent layers).
+    for _ in range(9):
+        cx = int(rng.integers(-150, width + 150))
+        cy = int(rng.integers(-150, height + 150))
+        radius = int(rng.integers(90, 310))
+        col = [c1, c2, c3][int(rng.integers(0, 3))]
+        for k in range(5, 0, -1):
+            rr = int(radius * k / 5)
+            alpha = int(7 + (6-k) * 5)
+            d.ellipse((cx-rr, cy-rr, cx+rr, cy+rr), fill=(*col, alpha))
+
+    # Comic halftone field.
+    spacing = int(rng.integers(22, 34))
+    dot = max(2, spacing // 7)
+    for yy in range(0, height, spacing):
+        for xx in range(0, width, spacing):
+            if rng.random() < 0.78:
+                alpha = int(rng.integers(18, 48))
+                d.ellipse((xx-dot, yy-dot, xx+dot, yy+dot), fill=(255,255,255,alpha))
+
+    # Dynamic comic panels and speed lines.
+    for _ in range(5):
+        y0 = int(rng.integers(0, height))
+        y1 = y0 + int(rng.integers(20, 90))
+        d.rectangle((0, y0, width, min(height, y1)), fill=(255,255,255,int(rng.integers(4,15))))
+    for _ in range(18):
+        x0 = int(rng.integers(0, width))
+        y0 = int(rng.integers(0, height))
+        x1 = x0 + int(rng.integers(-250, 250))
+        y1 = y0 + int(rng.integers(80, 300))
+        d.line((x0,y0,x1,y1), fill=(255,255,255,int(rng.integers(8,28))), width=int(rng.integers(2,7)))
+
+    # Context badges derived from the prompt, without using external images.
+    p = prompt.lower()
+    badges = []
+    if any(k in p for k in ("code", "coding", "bug", "python", "sql", "compile")):
+        badges = ["</>", "BUG", "404", "⚡"]
+    elif any(k in p for k in ("exam", "college", "class", "prof", "gpa", "mark")):
+        badges = ["EXAM", "A+", "💀", "?!"]
+    elif any(k in p for k in ("work", "office", "meeting", "boss", "deadline")):
+        badges = ["9–5", "MEETING", "URGENT", "😵"]
+    elif any(k in p for k in ("money", "salary", "job", "intern", "trading")):
+        badges = ["₹", "PAYDAY", "BROKE", "📈"]
+    else:
+        badges = ["POV", "BRUH", "LOL", "?!"]
+
+    try:
+        font = get_font(72, True)
+    except Exception:
+        font = ImageFont.load_default()
+    for i, badge in enumerate(badges):
+        bx = int((0.08 + i * 0.22) * width)
+        by = int(rng.integers(int(height*.12), int(height*.78)))
+        bbox = d.textbbox((bx, by), badge, font=font)
+        pad = 18
+        d.rounded_rectangle(
+            (bbox[0]-pad, bbox[1]-pad, bbox[2]+pad, bbox[3]+pad),
+            radius=20,
+            fill=(0,0,0,95),
+            outline=(255,255,255,80),
+            width=2,
+        )
+        d.text((bx, by), badge, font=font, fill=(255,255,255,105))
+
+    overlay = overlay.filter(ImageFilter.GaussianBlur(0.7))
+    img = Image.alpha_composite(img, overlay).convert("RGB")
+    return ImageEnhance.Contrast(img).enhance(1.05)
 
 
 def render_meme(
@@ -1484,9 +1579,10 @@ def render_meme(
     caption: str,
     placement: str = "bottom",
     text_color: str = "#FFFFFF",
+    prompt: str = "",
 ) -> Image.Image:
     if image is None:
-        image = make_gradient_background()
+        image = make_gradient_background(prompt=prompt or caption, style="chaotic")
 
     img = image.convert("RGB")
 
@@ -1590,6 +1686,7 @@ def generate_pipeline(
         image=image,
         caption=winner.caption,
         placement=winner.placement,
+        prompt=prompt,
     )
 
     latency = int((time.perf_counter() - start) * 1000)
@@ -1817,8 +1914,8 @@ if st.session_state.page == "Create":
           <div class="pill">MULTIMODAL MEME ENGINE</div>
           <div class="hero-title">Turn a situation into a <span class="gradient">high-signal meme.</span></div>
           <div class="muted">
-            GPT-OSS reasoning → candidate generation → ML ranking → AI evaluation →
-            computer-vision layout → final render.
+            AI reasoning → candidate generation → local ranking → safe layout →
+            unlimited local image rendering.
           </div>
         </div>
         """,
@@ -1901,16 +1998,16 @@ if st.session_state.page == "Create":
             type="primary",
         )
 
+        st.caption("♾️ Local image engine: no image API, no per-image quota, no paid image service.")
+
     with center:
         st.markdown("### Live canvas")
 
         if generate:
             if not prompt.strip():
                 st.warning("Describe the situation first.")
-            elif not groq_client:
-                st.error("GROQ_API_KEY is not configured.")
             else:
-                with st.spinner("Running multimodal creative pipeline..."):
+                with st.spinner("Running creative pipeline..."):
                     try:
                         result = generate_pipeline(
                             prompt=prompt,
