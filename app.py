@@ -1,5 +1,5 @@
 """
-MemeGen X — Enterprise AI Meme Studio
+MemeGen X — Enterprise AI Creative Studio
 Single-file full-stack Streamlit application.
 
 Install:
@@ -11,12 +11,8 @@ Optional:
 Run:
     streamlit run app.py
 
-Streamlit Cloud Secrets:
-    SUPABASE_URL = "https://almmvgiimkftvgdsiiko.supabase.co"
-    SUPABASE_PUBLISHABLE_KEY = "sb_publishable_..."
-    GROQ_API_KEY = "gsk_..."
-
-Environment variables are also supported locally.
+Supabase credentials may be supplied through Streamlit Secrets/env OR
+entered directly in the application's Supabase configuration panel.
 
 Current Groq model choices used here:
     MAIN_MODEL  = openai/gpt-oss-120b
@@ -89,29 +85,31 @@ st.set_page_config(
 )
 
 APP_NAME = "MemeGen X"
+APP_VERSION = "2.0.0-enterprise"
 DB_PATH = Path("memegen_x.db")
 
 def secret(name: str, default: str = "") -> str:
-    """Read Streamlit Cloud Secrets first, then environment variables."""
+    """Read Streamlit Secrets first, then environment variables."""
     try:
         value = st.secrets.get(name)
         if value is not None and str(value).strip():
             return str(value).strip()
     except Exception:
         pass
-    return os.getenv(name, default)
+    value = os.getenv(name, default)
+    return str(value).strip() if value else default
 
 
-SUPABASE_URL = secret(
-    "SUPABASE_URL",
-    "https://almmvgiimkftvgdsiiko.supabase.co",
-)
-# Preferred current Supabase key. Also accepts legacy anon key for compatibility.
+DEFAULT_SUPABASE_URL = "https://almmvgiimkftvgdsiiko.supabase.co"
+
+# Supabase may come from Streamlit Secrets/env OR be entered in the website.
+SUPABASE_URL = secret("SUPABASE_URL", DEFAULT_SUPABASE_URL)
 SUPABASE_PUBLISHABLE_KEY = secret(
     "SUPABASE_PUBLISHABLE_KEY",
     secret("SUPABASE_ANON_KEY", ""),
 )
 SUPABASE_SECRET_KEY = secret("SUPABASE_SECRET_KEY", "")
+
 
 ASSET_DIR = Path("memegen_assets")
 ASSET_DIR.mkdir(exist_ok=True)
@@ -130,28 +128,46 @@ else:
     groq_client = None
 
 @st.cache_resource
-def get_supabase_client():
+def build_supabase_client(url: str, key: str):
+    """Create Supabase client from credentials currently supplied."""
     if create_client is None:
         return None
-
-    # Browser/client-safe key. Never use the sb_secret key in this user path.
-    key = SUPABASE_PUBLISHABLE_KEY
-    if not SUPABASE_URL or not key:
+    url = (url or "").strip()
+    key = (key or "").strip()
+    if not url or not key:
         return None
-
     try:
-        return create_client(SUPABASE_URL, key)
+        return create_client(url, key)
     except Exception:
         return None
 
-supabase_client = get_supabase_client()
 
-SUPABASE_READY = bool(
-    create_client is not None
-    and SUPABASE_URL
-    and SUPABASE_PUBLISHABLE_KEY
-    and supabase_client is not None
-)
+def get_active_supabase():
+    url = st.session_state.get("supabase_url", SUPABASE_URL)
+    key = st.session_state.get(
+        "supabase_publishable_key",
+        SUPABASE_PUBLISHABLE_KEY,
+    )
+    return build_supabase_client(url, key)
+
+
+supabase_client = None
+
+
+def configuration_status() -> dict[str, bool]:
+    """Return non-secret configuration health indicators."""
+    return {
+        "supabase_package": create_client is not None,
+        "supabase_url": bool(st.session_state.get("supabase_url", SUPABASE_URL)),
+        "supabase_key": bool(
+            st.session_state.get(
+                "supabase_publishable_key",
+                SUPABASE_PUBLISHABLE_KEY,
+            )
+        ),
+        "supabase_client": get_active_supabase() is not None,
+        "groq_key": bool(GROQ_API_KEY),
+    }
 
 
 # ============================================================================
@@ -251,6 +267,8 @@ defaults = {
     "last_result": None,
     "history_refresh": 0,
     "project": "Default Workspace",
+    "supabase_url": SUPABASE_URL,
+    "supabase_publishable_key": SUPABASE_PUBLISHABLE_KEY,
 }
 
 for k, v in defaults.items():
@@ -467,14 +485,15 @@ def create_user(email: str, password: str) -> tuple[bool, str]:
     if len(password) < 8:
         return False, "Password must contain at least 8 characters."
 
-    if supabase_client is None:
+    client = get_active_supabase()
+    if client is None:
         return False, (
-            "Supabase is not configured. Check SUPABASE_URL and "
-            "SUPABASE_PUBLISHABLE_KEY in Streamlit Secrets."
+            "Supabase is not connected. Enter the URL and publishable/anon "
+            "key in the configuration panel."
         )
 
     try:
-        result = supabase_client.auth.sign_up(
+        result = client.auth.sign_up(
             {"email": email, "password": password}
         )
 
@@ -516,14 +535,15 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
     if not email or not password:
         return False, "Enter your email and password."
 
-    if supabase_client is None:
+    client = get_active_supabase()
+    if client is None:
         return False, (
-            "Supabase is not configured. Check SUPABASE_URL and "
-            "SUPABASE_PUBLISHABLE_KEY in Streamlit Secrets."
+            "Supabase is not connected. Enter the URL and publishable/anon "
+            "key in the configuration panel."
         )
 
     try:
-        result = supabase_client.auth.sign_in_with_password(
+        result = client.auth.sign_in_with_password(
             {"email": email, "password": password}
         )
 
@@ -572,6 +592,48 @@ def auth_page() -> None:
 
     a, b, c = st.columns([1, 1.3, 1])
     with b:
+        st.markdown("### Connect your Supabase project")
+        st.caption(
+            "You can enter the Supabase URL and publishable/anon key directly here. "
+            "Streamlit Secrets are optional."
+        )
+
+        with st.expander("Supabase configuration", expanded=not bool(
+            st.session_state.get("supabase_publishable_key")
+        )):
+            url_input = st.text_input(
+                "Supabase Project URL",
+                value=st.session_state.get("supabase_url", DEFAULT_SUPABASE_URL),
+                placeholder="https://your-project.supabase.co",
+            )
+            key_input = st.text_input(
+                "Supabase Publishable Key",
+                value=st.session_state.get("supabase_publishable_key", ""),
+                type="password",
+                placeholder="sb_publishable_... or legacy anon key",
+            )
+
+            if st.button("Connect Supabase", use_container_width=True):
+                test_client = build_supabase_client(url_input, key_input)
+                if test_client is None:
+                    st.error(
+                        "Supabase client could not be initialized. "
+                        "Check the URL and publishable/anon key."
+                    )
+                else:
+                    st.session_state.supabase_url = url_input.strip()
+                    st.session_state.supabase_publishable_key = key_input.strip()
+                    st.success("Supabase connected.")
+                    st.rerun()
+
+        global supabase_client
+        supabase_client = get_active_supabase()
+
+        if supabase_client is not None:
+            st.success("Supabase connected")
+        else:
+            st.info("Enter the Supabase URL and publishable key above.")
+
         tab1, tab2 = st.tabs(["Sign in", "Create account"])
 
         with tab1:
@@ -2185,3 +2247,12 @@ MEMEGEN_STT_MODEL={STT_MODEL}
         )
     else:
         st.caption("No audit events yet.")
+
+
+# ============================================================================
+# ENTERPRISE FOOTER
+# ============================================================================
+st.caption(
+    f"MemeGen X Enterprise {APP_VERSION} • Supabase Auth • AI orchestration • "
+    "local quality ranking • audit-ready workflow"
+)
