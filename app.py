@@ -752,6 +752,79 @@ class Scores:
     overall: float
 
 
+# Groq Structured Outputs schemas. Strict mode is used for production-critical
+# JSON calls so the API cannot reject a model-generated object after decoding.
+JSON_SCHEMAS: dict[str, dict[str, Any]] = {
+    "intent": {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string"},
+            "emotion": {"type": "string"},
+            "audience": {"type": "string"},
+            "style": {"type": "string"},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+            "visual_concept": {"type": "string"},
+            "safety_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        },
+        "required": ["topic", "emotion", "audience", "style", "keywords", "visual_concept", "safety_risk"],
+        "additionalProperties": False,
+    },
+    "candidates": {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "caption": {"type": "string"},
+                        "hook": {"type": "string"},
+                        "template_hint": {
+                            "type": "string",
+                            "enum": ["reaction", "drake", "top-bottom", "office", "college", "coding", "custom"],
+                        },
+                        "placement": {"type": "string", "enum": ["top", "bottom"]},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["caption", "hook", "template_hint", "placement", "rationale"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["candidates"],
+        "additionalProperties": False,
+    },
+    "rerank": {
+        "type": "object",
+        "properties": {
+            "winner": {"type": "integer"},
+            "reason": {"type": "string"},
+            "quality": {"type": "number"},
+        },
+        "required": ["winner", "reason", "quality"],
+        "additionalProperties": False,
+    },
+    "safety": {
+        "type": "object",
+        "properties": {"safe": {"type": "boolean"}},
+        "required": ["safe"],
+        "additionalProperties": False,
+    },
+    "vision": {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},
+            "emotion": {"type": "string"},
+            "text_in_image": {"type": "string"},
+            "safe_zone": {"type": "string", "enum": ["top", "bottom"]},
+            "meme_ideas": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["description", "emotion", "text_in_image", "safe_zone", "meme_ideas"],
+        "additionalProperties": False,
+    },
+}
+
+
 def ai_chat(
     messages: list[dict[str, Any]],
     model: str = MAIN_MODEL,
@@ -759,6 +832,7 @@ def ai_chat(
     max_tokens: int = 1800,
     reasoning_effort: str = "medium",
     json_mode: bool = False,
+    schema_name: str | None = None,
 ) -> str:
     if not groq_client:
         raise RuntimeError(
@@ -770,14 +844,62 @@ def ai_chat(
         "messages": messages,
         "temperature": temperature,
         "max_completion_tokens": max_tokens,
-        "reasoning_effort": reasoning_effort,
     }
 
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
+    # GPT-OSS supports low/medium/high reasoning. Explicitly suppressing
+    # reasoning in the returned content keeps structured output clean.
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if model.startswith("openai/gpt-oss"):
+        kwargs["include_reasoning"] = False
 
-    response = groq_client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content or ""
+    if json_mode:
+        schema = JSON_SCHEMAS.get(schema_name or "")
+        if schema is not None:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+
+    try:
+        response = groq_client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        # One controlled fallback for providers/model revisions that reject
+        # strict structured output. Never expose a raw 400 to the UI.
+        if json_mode and kwargs.get("response_format", {}).get("type") == "json_schema":
+            fallback = dict(kwargs)
+            fallback["response_format"] = {"type": "json_object"}
+            try:
+                response = groq_client.chat.completions.create(**fallback)
+            except Exception as fallback_exc:
+                # Final compatibility path: plain text + local JSON parsing.
+                # The prompts still explicitly require JSON, so this keeps the
+                # app usable if a model revision temporarily rejects structured
+                # output while avoiding an uncaught HTTP 400.
+                plain = dict(kwargs)
+                plain.pop("response_format", None)
+                try:
+                    response = groq_client.chat.completions.create(**plain)
+                except Exception as plain_exc:
+                    raise RuntimeError(
+                        f"AI request failed after structured-output retries: {plain_exc}"
+                    ) from plain_exc
+        else:
+            raise RuntimeError(f"AI request failed: {exc}") from exc
+
+    content = response.choices[0].message.content or ""
+    if json_mode:
+        parsed = safe_json(content, None)
+        if parsed is None:
+            raise RuntimeError("AI returned an invalid JSON object.")
+        return json.dumps(parsed, ensure_ascii=False)
+    return content
 
 
 def analyze_prompt(prompt: str, language: str, tone: str) -> dict[str, Any]:
@@ -811,6 +933,7 @@ Return:
                 max_tokens=700,
                 reasoning_effort="low",
                 json_mode=True,
+                schema_name="intent",
             ),
             {
                 "topic": "general",
@@ -889,16 +1012,50 @@ Return:
 }}
 """
 
-    raw = ai_chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        model=MAIN_MODEL,
-        temperature=max(.25, min(1.0, creativity)),
-        max_tokens=1800,
-        reasoning_effort="high",
-        json_mode=True,
-    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    data = {"candidates": []}
 
-    data = safe_json(raw, {"candidates": []})
+    # Primary model -> fast model -> deterministic local fallback.
+    # A transient model/rate-limit failure must not break meme generation.
+    for model_name, effort in ((MAIN_MODEL, "high"), (FAST_MODEL, "low")):
+        try:
+            raw = ai_chat(
+                messages,
+                model=model_name,
+                temperature=max(.25, min(1.0, creativity)),
+                max_tokens=1800,
+                reasoning_effort=effort,
+                json_mode=True,
+                schema_name="candidates",
+            )
+            data = safe_json(raw, {"candidates": []})
+            if data.get("candidates"):
+                break
+        except Exception:
+            continue
+
+    if not data.get("candidates"):
+        compact = re.sub(r"\s+", " ", prompt).strip()[:100]
+        fallback_templates = [
+            f"POV: {compact} 💀",
+            f"Me: {compact}\nAlso me: it's fine.",
+            f"Nobody:\nAbsolutely nobody:\nMe: {compact}",
+            f"That moment when {compact} 😭",
+            f"Bro really said: {compact}",
+            f"Task failed successfully: {compact}",
+        ]
+        data = {
+            "candidates": [
+                {
+                    "caption": c,
+                    "hook": "local fallback",
+                    "template_hint": "reaction",
+                    "placement": "bottom",
+                    "rationale": "deterministic fallback",
+                }
+                for c in fallback_templates
+            ]
+        }
     output: list[Candidate] = []
 
     for item in data.get("candidates", []):
@@ -1064,6 +1221,7 @@ Return:
                 max_tokens=500,
                 reasoning_effort="high",
                 json_mode=True,
+                schema_name="rerank",
             ),
             {"winner": 0, "quality": local_scores[0].overall, "reason": "local rank"},
         )
@@ -1094,6 +1252,7 @@ def safety_check(text: str) -> bool:
             max_tokens=120,
             reasoning_effort="low",
             json_mode=True,
+            schema_name="safety",
         )
         return bool(safe_json(result, {"safe": True}).get("safe", True))
     except Exception:
@@ -1133,7 +1292,14 @@ def vision_analyze(image_bytes: bytes, instruction: str) -> dict[str, Any]:
         temperature=.4,
         max_completion_tokens=1200,
         reasoning_effort="medium",
-        response_format={"type": "json_object"},
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "vision_analysis",
+                "strict": True,
+                "schema": JSON_SCHEMAS["vision"],
+            },
+        },
     )
 
     return safe_json(
