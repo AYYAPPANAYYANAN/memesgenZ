@@ -3,7 +3,7 @@ MemeGen X — Enterprise AI Creative Studio
 Single-file full-stack Streamlit application.
 
 Install:
-    pip install streamlit groq pillow opencv-python numpy python-dotenv requests
+    pip install -r requirements.txt
 
 Optional:
     pip install duckduckgo-search
@@ -74,99 +74,143 @@ except Exception:
 
 
 # ============================================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================================
+# All credentials and runtime configuration come from .env / environment.
+# Never put secrets in source code, Streamlit widgets, logs, or Git.
 
-st.set_page_config(
-    page_title="MemeGen X — AI Creative Studio",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from functools import lru_cache
+from pydantic import BaseModel, Field, ValidationError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+
+class Settings(BaseModel):
+    app_name: str = "MemeGen X"
+    app_version: str = "3.0.0"
+    environment: str = "development"
+    db_path: Path = Path("data/memegen_x.db")
+    asset_dir: Path = Path("data/memegen_assets")
+
+    groq_api_key: str = Field(min_length=1)
+    supabase_url: str = Field(min_length=1)
+    supabase_publishable_key: str = Field(min_length=1)
+    supabase_secret_key: str = ""
+
+    storage_bucket: str = "memes"
+
+    main_model: str = "openai/gpt-oss-120b"
+    fast_model: str = "openai/gpt-oss-20b"
+    vision_model: str = "qwen/qwen3.8-27b"
+    safety_model: str = "openai/gpt-oss-safeguard-20b"
+    stt_model: str = "whisper-large-v3-turbo"
+
+    ai_timeout_seconds: float = 45.0
+    ai_max_retries: int = 3
+    max_upload_mb: int = 10
+    max_prompt_chars: int = 2000
+    max_caption_chars: int = 220
+    history_limit: int = 100
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        load_dotenv(override=False)
+
+        required = ["GROQ_API_KEY", "SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY"]
+        missing = [name for name in required if not os.getenv(name, "").strip()]
+        if missing:
+            raise RuntimeError(
+                "Missing required environment variables: " + ", ".join(missing)
+            )
+
+        return cls(
+            app_name=os.getenv("APP_NAME", "MemeGen X"),
+            app_version=os.getenv("APP_VERSION", "3.0.0"),
+            environment=os.getenv("APP_ENV", "development"),
+            db_path=Path(os.getenv("DB_PATH", "data/memegen_x.db")),
+            asset_dir=Path(os.getenv("ASSET_DIR", "data/memegen_assets")),
+            groq_api_key=os.environ["GROQ_API_KEY"].strip(),
+            supabase_url=os.environ["SUPABASE_URL"].strip(),
+            supabase_publishable_key=os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
+            supabase_secret_key=os.getenv("SUPABASE_SECRET_KEY", "").strip(),
+            storage_bucket=os.getenv("SUPABASE_STORAGE_BUCKET", "memes").strip(),
+            main_model=os.getenv("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b").strip(),
+            fast_model=os.getenv("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b").strip(),
+            vision_model=os.getenv("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b").strip(),
+            safety_model=os.getenv(
+                "MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b"
+            ).strip(),
+            stt_model=os.getenv(
+                "MEMEGEN_STT_MODEL", "whisper-large-v3-turbo"
+            ).strip(),
+            ai_timeout_seconds=float(os.getenv("AI_TIMEOUT_SECONDS", "45")),
+            ai_max_retries=int(os.getenv("AI_MAX_RETRIES", "3")),
+            max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "10")),
+            max_prompt_chars=int(os.getenv("MAX_PROMPT_CHARS", "2000")),
+            max_caption_chars=int(os.getenv("MAX_CAPTION_CHARS", "220")),
+            history_limit=int(os.getenv("HISTORY_LIMIT", "100")),
+        )
+
+
+@st.cache_resource
+def get_settings() -> Settings:
+    settings = Settings.from_env()
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.asset_dir.mkdir(parents=True, exist_ok=True)
+    return settings
+
+
+settings = get_settings()
+
+APP_NAME = settings.app_name
+APP_VERSION = settings.app_version
+DB_PATH = settings.db_path
+ASSET_DIR = settings.asset_dir
+
+MAIN_MODEL = settings.main_model
+FAST_MODEL = settings.fast_model
+VISION_MODEL = settings.vision_model
+SAFETY_MODEL = settings.safety_model
+STT_MODEL = settings.stt_model
+
+GROQ_API_KEY = settings.groq_api_key
+SUPABASE_URL = settings.supabase_url
+SUPABASE_PUBLISHABLE_KEY = settings.supabase_publishable_key
+SUPABASE_SECRET_KEY = settings.supabase_secret_key
+
+if Groq is None:
+    raise RuntimeError("The 'groq' package is required. Run: pip install groq")
+
+groq_client = Groq(
+    api_key=GROQ_API_KEY,
+    timeout=settings.ai_timeout_seconds,
+    max_retries=0,  # retries are controlled explicitly below
 )
 
-APP_NAME = "MemeGen X"
-APP_VERSION = "2.0.0-enterprise"
-DB_PATH = Path("memegen_x.db")
-
-def secret(name: str, default: str = "") -> str:
-    """Read Streamlit Secrets first, then environment variables."""
-    try:
-        value = st.secrets.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    except Exception:
-        pass
-    value = os.getenv(name, default)
-    return str(value).strip() if value else default
-
-
-DEFAULT_SUPABASE_URL = "https://almmvgiimkftvgdsiiko.supabase.co"
-
-# Supabase may come from Streamlit Secrets/env OR be entered in the website.
-SUPABASE_URL = secret("SUPABASE_URL", DEFAULT_SUPABASE_URL)
-SUPABASE_PUBLISHABLE_KEY = secret(
-    "SUPABASE_PUBLISHABLE_KEY",
-    secret("SUPABASE_ANON_KEY", ""),
-)
-SUPABASE_SECRET_KEY = secret("SUPABASE_SECRET_KEY", "")
-
-
-ASSET_DIR = Path("memegen_assets")
-ASSET_DIR.mkdir(exist_ok=True)
-
-MAIN_MODEL = secret("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b")
-FAST_MODEL = secret("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b")
-VISION_MODEL = secret("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b")
-SAFETY_MODEL = secret("MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b")
-STT_MODEL = secret("MEMEGEN_STT_MODEL", "whisper-large-v3-turbo")
-
-GROQ_API_KEY = secret("GROQ_API_KEY", "")
-
-if Groq and GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-else:
-    groq_client = None
 
 @st.cache_resource
 def build_supabase_client(url: str, key: str):
-    """Create Supabase client from credentials currently supplied."""
+    """Create the normal user-facing Supabase client.
+
+    Only the publishable/anon key belongs here. A Supabase secret key must
+    never be used in the Streamlit browser-facing session.
+    """
     if create_client is None:
-        return None
-    url = (url or "").strip()
-    key = (key or "").strip()
-    if not url or not key:
-        return None
-    try:
-        return create_client(url, key)
-    except Exception:
-        return None
+        raise RuntimeError("The 'supabase' package is required.")
+    return create_client(url, key)
 
 
-def get_active_supabase():
-    url = st.session_state.get("supabase_url", SUPABASE_URL)
-    key = st.session_state.get(
-        "supabase_publishable_key",
-        SUPABASE_PUBLISHABLE_KEY,
-    )
-    return build_supabase_client(url, key)
-
-
-supabase_client = None
+supabase_client = build_supabase_client(
+    SUPABASE_URL,
+    SUPABASE_PUBLISHABLE_KEY,
+)
 
 
 def configuration_status() -> dict[str, bool]:
-    """Return non-secret configuration health indicators."""
+    """Non-secret health indicators only."""
     return {
-        "supabase_package": create_client is not None,
-        "supabase_url": bool(st.session_state.get("supabase_url", SUPABASE_URL)),
-        "supabase_key": bool(
-            st.session_state.get(
-                "supabase_publishable_key",
-                SUPABASE_PUBLISHABLE_KEY,
-            )
-        ),
-        "supabase_client": get_active_supabase() is not None,
-        "groq_key": bool(GROQ_API_KEY),
+        "groq_configured": bool(GROQ_API_KEY),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY),
+        "storage_bucket_configured": bool(settings.storage_bucket),
     }
 
 
@@ -175,10 +219,20 @@ def configuration_status() -> dict[str, bool]:
 # ============================================================================
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    """Open a short-lived SQLite connection with safe defaults.
+
+    SQLite is suitable for local/single-process deployments. For multi-instance
+    production deployment, migrate this repository layer to PostgreSQL.
+    """
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=10,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -267,8 +321,6 @@ defaults = {
     "last_result": None,
     "history_refresh": 0,
     "project": "Default Workspace",
-    "supabase_url": SUPABASE_URL,
-    "supabase_publishable_key": SUPABASE_PUBLISHABLE_KEY,
 }
 
 for k, v in defaults.items():
@@ -592,47 +644,10 @@ def auth_page() -> None:
 
     a, b, c = st.columns([1, 1.3, 1])
     with b:
-        st.markdown("### Connect your Supabase project")
-        st.caption(
-            "You can enter the Supabase URL and publishable/anon key directly here. "
-            "Streamlit Secrets are optional."
-        )
-
-        with st.expander("Supabase configuration", expanded=not bool(
-            st.session_state.get("supabase_publishable_key")
-        )):
-            url_input = st.text_input(
-                "Supabase Project URL",
-                value=st.session_state.get("supabase_url", DEFAULT_SUPABASE_URL),
-                placeholder="https://your-project.supabase.co",
-            )
-            key_input = st.text_input(
-                "Supabase Publishable Key",
-                value=st.session_state.get("supabase_publishable_key", ""),
-                type="password",
-                placeholder="sb_publishable_... or legacy anon key",
-            )
-
-            if st.button("Connect Supabase", use_container_width=True):
-                test_client = build_supabase_client(url_input, key_input)
-                if test_client is None:
-                    st.error(
-                        "Supabase client could not be initialized. "
-                        "Check the URL and publishable/anon key."
-                    )
-                else:
-                    st.session_state.supabase_url = url_input.strip()
-                    st.session_state.supabase_publishable_key = key_input.strip()
-                    st.success("Supabase connected.")
-                    st.rerun()
-
-        global supabase_client
-        supabase_client = get_active_supabase()
-
         if supabase_client is not None:
             st.success("Supabase connected")
         else:
-            st.info("Enter the Supabase URL and publishable key above.")
+            st.error("Supabase is not configured. Check the server environment.")
 
         tab1, tab2 = st.tabs(["Sign in", "Create account"])
 
@@ -825,6 +840,38 @@ JSON_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+def _is_retryable_ai_error(exc: Exception) -> bool:
+    """Retry only transient/rate-limit/server failures."""
+    text = str(exc).lower()
+    transient_markers = (
+        "rate limit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
+def _ai_request(kwargs: dict[str, Any]):
+    last_exc: Exception | None = None
+
+    for attempt in range(1, settings.ai_max_retries + 1):
+        try:
+            return groq_client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= settings.ai_max_retries or not _is_retryable_ai_error(exc):
+                raise
+            time.sleep(min(2 ** (attempt - 1), 8))
+
+    raise RuntimeError("AI request failed") from last_exc
+
+
 def ai_chat(
     messages: list[dict[str, Any]],
     model: str = MAIN_MODEL,
@@ -834,11 +881,11 @@ def ai_chat(
     json_mode: bool = False,
     schema_name: str | None = None,
 ) -> str:
-    if not groq_client:
-        raise RuntimeError(
-            "GROQ_API_KEY is missing. Add it to your environment before generating."
-        )
+    """Single controlled AI gateway.
 
+    The UI never receives provider credentials and raw provider exceptions are
+    converted into safe application errors.
+    """
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -846,10 +893,9 @@ def ai_chat(
         "max_completion_tokens": max_tokens,
     }
 
-    # GPT-OSS supports low/medium/high reasoning. Explicitly suppressing
-    # reasoning in the returned content keeps structured output clean.
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
+
     if model.startswith("openai/gpt-oss"):
         kwargs["include_reasoning"] = False
 
@@ -868,41 +914,44 @@ def ai_chat(
             kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        response = groq_client.chat.completions.create(**kwargs)
+        response = _ai_request(kwargs)
     except Exception as exc:
-        # One controlled fallback for providers/model revisions that reject
-        # strict structured output. Never expose a raw 400 to the UI.
-        if json_mode and kwargs.get("response_format", {}).get("type") == "json_schema":
+        # Compatibility fallback only for structured-output incompatibility.
+        if (
+            json_mode
+            and kwargs.get("response_format", {}).get("type") == "json_schema"
+            and "400" in str(exc)
+        ):
             fallback = dict(kwargs)
             fallback["response_format"] = {"type": "json_object"}
             try:
-                response = groq_client.chat.completions.create(**fallback)
+                response = _ai_request(fallback)
             except Exception as fallback_exc:
-                # Final compatibility path: plain text + local JSON parsing.
-                # The prompts still explicitly require JSON, so this keeps the
-                # app usable if a model revision temporarily rejects structured
-                # output while avoiding an uncaught HTTP 400.
-                plain = dict(kwargs)
-                plain.pop("response_format", None)
-                try:
-                    response = groq_client.chat.completions.create(**plain)
-                except Exception as plain_exc:
-                    raise RuntimeError(
-                        f"AI request failed after structured-output retries: {plain_exc}"
-                    ) from plain_exc
+                raise RuntimeError(
+                    "AI provider rejected the request. Check the configured "
+                    "model and structured-output schema."
+                ) from fallback_exc
         else:
-            raise RuntimeError(f"AI request failed: {exc}") from exc
+            raise RuntimeError(
+                "AI service is temporarily unavailable. Please try again."
+            ) from exc
+
+    if not response.choices:
+        raise RuntimeError("AI service returned an empty response.")
 
     content = response.choices[0].message.content or ""
+
     if json_mode:
         parsed = safe_json(content, None)
         if parsed is None:
-            raise RuntimeError("AI returned an invalid JSON object.")
+            raise RuntimeError("AI returned invalid structured data.")
         return json.dumps(parsed, ensure_ascii=False)
+
     return content
 
 
 def analyze_prompt(prompt: str, language: str, tone: str) -> dict[str, Any]:
+    prompt = str(prompt).strip()[:settings.max_prompt_chars]
     system = """
 You are MemeGen X's intent-analysis engine.
 Convert a casual user situation into structured meme-generation intent.
@@ -971,6 +1020,8 @@ def generate_candidates(
         "Hindi": "Use natural conversational Hindi.",
         "German": "Use natural conversational German.",
     }
+
+    prompt = str(prompt).strip()[:settings.max_prompt_chars]
 
     system = f"""
 You are the primary creative reasoning engine for MemeGen X.
@@ -1714,23 +1765,25 @@ def image_to_bytes(image: Image.Image) -> bytes:
 # ============================================================================
 
 def supabase_upload_image(local_path: Path, object_name: str) -> Optional[str]:
-    """Upload to a Supabase Storage bucket named `memes`.
-    The bucket should be configured in the Supabase dashboard.
-    """
+    """Upload to the configured private Supabase Storage bucket."""
     if supabase_client is None:
         return None
 
     try:
         with local_path.open("rb") as f:
-            supabase_client.storage.from_("memes").upload(
-                object_name,
-                f.read(),
-                {"content-type": "image/png", "upsert": "true"},
+            supabase_client.storage.from_(settings.storage_bucket).upload(
+                path=object_name,
+                file=f,
+                file_options={
+                    "content-type": "image/png",
+                    "cache-control": "3600",
+                    "upsert": "false",
+                },
             )
-        try:
-            return supabase_client.storage.from_("memes").get_public_url(object_name)
-        except Exception:
-            return None
+        # Keep the bucket private by default. Return the object path, not a
+        # public URL. Use signed URLs through an authenticated endpoint when
+        # sharing is required.
+        return object_name
     except Exception as exc:
         log_event("storage.upload_failed", {"error": str(exc)})
         return None
@@ -1988,7 +2041,7 @@ if st.session_state.page == "Create":
                     st.session_state.prompt = text
                     st.rerun()
                 except Exception as exc:
-                    st.error(str(exc))
+                    st.error("The operation failed. Please retry. Check server logs for details.")
 
         st.markdown("---")
 
@@ -2021,7 +2074,7 @@ if st.session_state.page == "Create":
                         st.session_state.last_result = result
                         st.success(f"Generated in {result['latency_ms']} ms")
                     except Exception as exc:
-                        st.error(f"Generation failed: {exc}")
+                        st.error("Generation failed. Please retry. Check server logs for details.")
 
         result = st.session_state.last_result
 
@@ -2195,7 +2248,7 @@ elif st.session_state.page == "Vision Roast":
                             )
                             st.session_state["vision_result"] = vision
                         except Exception as exc:
-                            st.error(str(exc))
+                            st.error("The operation failed. Please retry. Check server logs for details.")
 
         vision = st.session_state.get("vision_result")
 
@@ -2234,7 +2287,7 @@ elif st.session_state.page == "Vision Roast":
                         st.image(result["image"], use_container_width=True)
                         st.success(result["winner"].caption)
                     except Exception as exc:
-                        st.error(str(exc))
+                        st.error("The operation failed. Please retry. Check server logs for details.")
 
 
 # ============================================================================
@@ -2433,29 +2486,22 @@ elif st.session_state.page == "Settings":
         unsafe_allow_html=True,
     )
 
-    st.markdown("### Supabase configuration")
+    st.markdown("### Runtime configuration")
     st.code(
-        f"""SUPABASE_URL={SUPABASE_URL}
-SUPABASE_PUBLISHABLE_KEY=<your sb_publishable_... key>
-SUPABASE_SECRET_KEY=<server-only sb_secret_... key>""",
-        language="bash",
-    )
-    st.caption(
-        "Use the publishable key for this Streamlit user path with RLS. "
-        "Keep the secret key server-only and never commit it."
-    )
-
-    st.markdown("### Model configuration")
-
-    st.code(
-        f"""
+        f"""APP_ENV={settings.environment}
+DB_PATH={settings.db_path}
+ASSET_DIR={settings.asset_dir}
+SUPABASE_STORAGE_BUCKET={settings.storage_bucket}
 MEMEGEN_MAIN_MODEL={MAIN_MODEL}
 MEMEGEN_FAST_MODEL={FAST_MODEL}
 MEMEGEN_VISION_MODEL={VISION_MODEL}
 MEMEGEN_SAFETY_MODEL={SAFETY_MODEL}
-MEMEGEN_STT_MODEL={STT_MODEL}
-        """.strip(),
+MEMEGEN_STT_MODEL={STT_MODEL}""",
         language="bash",
+    )
+    st.caption(
+        "Credentials are server-side environment variables and are intentionally "
+        "not displayed in the application."
     )
 
     st.markdown("### Product controls")
