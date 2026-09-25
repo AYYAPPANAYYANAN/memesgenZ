@@ -11,8 +11,8 @@ Optional:
 Run:
     streamlit run app.py
 
-Supabase credentials may be supplied through Streamlit Secrets/env OR
-entered directly in the application's Supabase configuration panel.
+Supabase credentials are loaded from environment variables only.
+Never enter or print credentials from the UI.
 
 Current Groq model choices used here:
     MAIN_MODEL  = openai/gpt-oss-120b
@@ -79,14 +79,12 @@ except Exception:
 # All credentials and runtime configuration come from .env / environment.
 # Never put secrets in source code, Streamlit widgets, logs, or Git.
 
-from functools import lru_cache
-from pydantic import BaseModel, Field, ValidationError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pydantic import BaseModel, Field
 
 
 class Settings(BaseModel):
     app_name: str = "MemeGen X"
-    app_version: str = "3.0.0"
+    app_version: str = "4.0.0-layered"
     environment: str = "development"
     db_path: Path = Path("data/memegen_x.db")
     asset_dir: Path = Path("data/memegen_assets")
@@ -113,41 +111,63 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls) -> "Settings":
+        """Load configuration from Streamlit Secrets first, then environment.
+
+        Secrets remain server-side: they are never rendered into widgets or logs.
+        This fixes Streamlit Cloud deployments where values live in st.secrets
+        instead of process environment variables.
+        """
         load_dotenv(override=False)
 
-        required = ["GROQ_API_KEY", "SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY"]
-        missing = [name for name in required if not os.getenv(name, "").strip()]
+        def read(name: str, default: str = "") -> str:
+            try:
+                value = st.secrets.get(name)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+            except Exception:
+                pass
+            return os.getenv(name, default).strip() if os.getenv(name, default) else default
+
+        groq_key = read("GROQ_API_KEY")
+        supabase_url = read("SUPABASE_URL")
+        supabase_key = read("SUPABASE_PUBLISHABLE_KEY") or read("SUPABASE_ANON_KEY")
+        missing = []
+        if not groq_key: missing.append("GROQ_API_KEY")
+        if not supabase_url: missing.append("SUPABASE_URL")
+        if not supabase_key: missing.append("SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY")
         if missing:
-            raise RuntimeError(
-                "Missing required environment variables: " + ", ".join(missing)
-            )
+            raise RuntimeError("Missing required secrets/environment variables: " + ", ".join(missing))
+
+        def as_float(name: str, default: float) -> float:
+            try: return float(read(name, str(default)))
+            except (TypeError, ValueError): return default
+
+        def as_int(name: str, default: int) -> int:
+            try: return int(read(name, str(default)))
+            except (TypeError, ValueError): return default
 
         return cls(
-            app_name=os.getenv("APP_NAME", "MemeGen X"),
-            app_version=os.getenv("APP_VERSION", "3.0.0"),
-            environment=os.getenv("APP_ENV", "development"),
-            db_path=Path(os.getenv("DB_PATH", "data/memegen_x.db")),
-            asset_dir=Path(os.getenv("ASSET_DIR", "data/memegen_assets")),
-            groq_api_key=os.environ["GROQ_API_KEY"].strip(),
-            supabase_url=os.environ["SUPABASE_URL"].strip(),
-            supabase_publishable_key=os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
-            supabase_secret_key=os.getenv("SUPABASE_SECRET_KEY", "").strip(),
-            storage_bucket=os.getenv("SUPABASE_STORAGE_BUCKET", "memes").strip(),
-            main_model=os.getenv("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b").strip(),
-            fast_model=os.getenv("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b").strip(),
-            vision_model=os.getenv("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b").strip(),
-            safety_model=os.getenv(
-                "MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b"
-            ).strip(),
-            stt_model=os.getenv(
-                "MEMEGEN_STT_MODEL", "whisper-large-v3-turbo"
-            ).strip(),
-            ai_timeout_seconds=float(os.getenv("AI_TIMEOUT_SECONDS", "45")),
-            ai_max_retries=int(os.getenv("AI_MAX_RETRIES", "3")),
-            max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "10")),
-            max_prompt_chars=int(os.getenv("MAX_PROMPT_CHARS", "2000")),
-            max_caption_chars=int(os.getenv("MAX_CAPTION_CHARS", "220")),
-            history_limit=int(os.getenv("HISTORY_LIMIT", "100")),
+            app_name=read("APP_NAME", "MemeGen X"),
+            app_version=read("APP_VERSION", "4.0.0-layered"),
+            environment=read("APP_ENV", "development"),
+            db_path=Path(read("DB_PATH", "data/memegen_x.db")),
+            asset_dir=Path(read("ASSET_DIR", "data/memegen_assets")),
+            groq_api_key=groq_key,
+            supabase_url=supabase_url,
+            supabase_publishable_key=supabase_key,
+            supabase_secret_key=read("SUPABASE_SECRET_KEY"),
+            storage_bucket=read("SUPABASE_STORAGE_BUCKET", "memes"),
+            main_model=read("MEMEGEN_MAIN_MODEL", "openai/gpt-oss-120b"),
+            fast_model=read("MEMEGEN_FAST_MODEL", "openai/gpt-oss-20b"),
+            vision_model=read("MEMEGEN_VISION_MODEL", "qwen/qwen3.8-27b"),
+            safety_model=read("MEMEGEN_SAFETY_MODEL", "openai/gpt-oss-safeguard-20b"),
+            stt_model=read("MEMEGEN_STT_MODEL", "whisper-large-v3-turbo"),
+            ai_timeout_seconds=max(5.0, min(as_float("AI_TIMEOUT_SECONDS", 45.0), 120.0)),
+            ai_max_retries=max(1, min(as_int("AI_MAX_RETRIES", 3), 5)),
+            max_upload_mb=max(1, min(as_int("MAX_UPLOAD_MB", 10), 20)),
+            max_prompt_chars=max(100, min(as_int("MAX_PROMPT_CHARS", 2000), 5000)),
+            max_caption_chars=max(50, min(as_int("MAX_CAPTION_CHARS", 220), 500)),
+            history_limit=max(10, min(as_int("HISTORY_LIMIT", 100), 500)),
         )
 
 
@@ -189,14 +209,13 @@ groq_client = Groq(
 
 @st.cache_resource
 def build_supabase_client(url: str, key: str):
-    """Create the normal user-facing Supabase client.
-
-    Only the publishable/anon key belongs here. A Supabase secret key must
-    never be used in the Streamlit browser-facing session.
-    """
-    if create_client is None:
-        raise RuntimeError("The 'supabase' package is required.")
-    return create_client(url, key)
+    """Create the normal user-facing Supabase client safely."""
+    if create_client is None or not url or not key:
+        return None
+    try:
+        return create_client(url.strip(), key.strip())
+    except Exception:
+        return None
 
 
 supabase_client = build_supabase_client(
@@ -282,6 +301,7 @@ def init_db() -> None:
             originality REAL,
             visual REAL,
             safety REAL,
+            diversity REAL DEFAULT 1.0,
             overall REAL,
             evaluator_model TEXT,
             created_at TEXT NOT NULL,
@@ -302,6 +322,19 @@ def init_db() -> None:
 
 
 init_db()
+
+# Lightweight forward migration for existing local databases.
+def migrate_db() -> None:
+    conn = db()
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()}
+        if "diversity" not in cols:
+            conn.execute("ALTER TABLE evaluations ADD COLUMN diversity REAL DEFAULT 1.0")
+            conn.commit()
+    finally:
+        conn.close()
+
+migrate_db()
 
 
 # ============================================================================
@@ -754,6 +787,7 @@ class Candidate:
     template_hint: str = "reaction"
     placement: str = "bottom"
     rationale: str = ""
+    source: str = "llm"
 
 
 @dataclass
@@ -764,6 +798,7 @@ class Scores:
     originality: float
     visual: float
     safety: float
+    diversity: float
     overall: float
 
 
@@ -1103,6 +1138,7 @@ Return:
                     "template_hint": "reaction",
                     "placement": "bottom",
                     "rationale": "deterministic fallback",
+                    "source": "fallback",
                 }
                 for c in fallback_templates
             ]
@@ -1119,106 +1155,84 @@ Return:
                     template_hint=str(item.get("template_hint", "reaction")),
                     placement=str(item.get("placement", "bottom")),
                     rationale=str(item.get("rationale", "")),
+                    source="llm",
                 )
             )
 
     return output[:6]
 
 
-def deterministic_ml_features(
-    prompt: str,
-    candidate: Candidate,
-    language: str,
-) -> dict[str, float]:
-    """
-    Lightweight local ML/ranking feature extractor.
-    This is intentionally deterministic and requires no GPU.
-    """
+def _tokens(text: str) -> set[str]:
+    return set(re.findall(r"\b[\w\u0B80-\u0BFF]+\b", text.lower()))
 
-    p = prompt.lower()
-    c = candidate.caption.lower()
 
-    p_words = set(re.findall(r"\b\w+\b", p))
-    c_words = set(re.findall(r"\b\w+\b", c))
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / max(1, len(a | b))
 
+
+def deterministic_ml_features(prompt: str, candidate: Candidate, language: str) -> dict[str, float]:
+    """Transparent CPU-only feature extraction; no fake neural scoring."""
+    p_words, c_words = _tokens(prompt), _tokens(candidate.caption)
     overlap = len(p_words & c_words) / max(1, len(p_words))
-    length_quality = 1.0 - min(abs(len(c.split()) - 9) / 14, 1)
-
-    slang_terms = [
-        "bro", "vro", "pangu", "maapu", "da", "dei",
-        "lol", "bruh", "literally", "fr", "💀", "😂"
-    ]
-    slang_score = min(sum(1 for x in slang_terms if x in c) / 3, 1)
-
-    punch_score = min(
-        (c.count("!") * .10)
-        + (c.count("?") * .10)
-        + (c.count("💀") * .20)
-        + (c.count("😂") * .15)
-        + (0.15 if any(w in c for w in ["when", "me", "bro", "me:", "also"]) else 0),
-        1,
-    )
-
-    repetition_penalty = 0 if len(c_words) >= max(3, len(c.split()) * .55) else .25
-
-    language_bonus = slang_score if language == "Tanglish" else .65
-
+    words = candidate.caption.split()
+    length_quality = 1.0 - min(abs(len(words) - 10) / 16.0, 1.0)
+    slang_terms = ["bro", "vro", "pangu", "maapu", "da", "dei", "lol", "bruh", "literally", "fr", "💀", "😂"]
+    slang_score = min(sum(1 for x in slang_terms if x in candidate.caption.lower()) / 3.0, 1.0)
+    punch = min(0.15 * candidate.caption.count("!") + 0.12 * candidate.caption.count("?") + 0.20 * candidate.caption.count("💀") + 0.15 * candidate.caption.count("😂") + (0.15 if any(x in candidate.caption.lower() for x in ("pov", "me:", "when", "bro", "nobody")) else 0), 1.0)
+    repeated = 1.0 - len(c_words) / max(1, len(words))
+    language_fit = slang_score if language == "Tanglish" else (0.55 + 0.35 * slang_score)
+    template_fit = 0.9 if candidate.template_hint in {"reaction", "top-bottom", "college", "coding", "office"} else 0.75
     return {
-        "semantic_overlap": min(overlap, 1),
-        "length_quality": max(0, length_quality),
-        "slang_fit": language_bonus,
-        "punch": min(punch_score, 1),
-        "repetition": repetition_penalty,
+        "semantic_overlap": min(overlap, 1.0),
+        "length_quality": max(0.0, length_quality),
+        "language_fit": min(1.0, language_fit),
+        "punch": min(1.0, punch),
+        "repetition": max(0.0, min(1.0, repeated)),
+        "template_fit": template_fit,
     }
 
 
-def local_score(candidate: Candidate, prompt: str, language: str) -> Scores:
+def local_score(candidate: Candidate, prompt: str, language: str, safety: float = 1.0) -> Scores:
     f = deterministic_ml_features(prompt, candidate, language)
+    relevance = 0.55 * f["semantic_overlap"] + 0.25 * f["length_quality"] + 0.20 * f["punch"]
+    humor = 0.45 * f["punch"] + 0.25 * f["length_quality"] + 0.20 * f["language_fit"] + 0.10 * f["template_fit"]
+    language_score = 0.65 + 0.35 * f["language_fit"]
+    originality = max(0.35, 1.0 - 0.75 * f["repetition"])
+    visual = 0.55 * f["length_quality"] + 0.45 * f["template_fit"]
+    return Scores(relevance=round(relevance,3), humor=round(humor,3), language=round(language_score,3), originality=round(originality,3), visual=round(visual,3), safety=round(safety,3), diversity=1.0, overall=0.0)
 
-    relevance = (
-        .55 * f["semantic_overlap"]
-        + .25 * f["length_quality"]
-        + .20 * f["punch"]
-    )
 
-    humor = (
-        .45 * f["punch"]
-        + .30 * f["length_quality"]
-        + .25 * f["slang_fit"]
-    )
+def apply_mmr_diversity(candidates: list[Candidate], scores: list[Scores], k: int = 4, lambda_: float = 0.78) -> list[int]:
+    """Maximal Marginal Relevance: keep quality while avoiding six near-duplicates."""
+    if not candidates:
+        return []
+    remaining = set(range(len(candidates)))
+    selected: list[int] = []
+    while remaining and len(selected) < min(k, len(candidates)):
+        best, best_value = None, -1e9
+        for i in remaining:
+            redundancy = max((_jaccard(_tokens(candidates[i].caption), _tokens(candidates[j].caption)) for j in selected), default=0.0)
+            value = lambda_ * scores[i].overall - (1.0 - lambda_) * redundancy
+            if value > best_value:
+                best, best_value = i, value
+        selected.append(best)
+        remaining.remove(best)
+    return selected
 
-    language_score = .72 + .28 * f["slang_fit"]
 
-    # Originality proxy:
-    # penalize repetitive structural patterns without pretending this is
-    # a semantic originality detector.
-    originality = max(
-        .45,
-        1.0 - f["repetition"] - (0.10 if candidate.caption.lower().startswith("when when") else 0),
-    )
-
-    visual = .55 + .45 * f["length_quality"]
-    safety = .98
-
-    overall = (
-        .30 * relevance
-        + .25 * humor
-        + .15 * language_score
-        + .15 * originality
-        + .10 * visual
-        + .05 * safety
-    )
-
-    return Scores(
-        relevance=round(relevance, 3),
-        humor=round(humor, 3),
-        language=round(language_score, 3),
-        originality=round(originality, 3),
-        visual=round(visual, 3),
-        safety=round(safety, 3),
-        overall=round(overall, 3),
-    )
-
+def finalize_scores(candidates: list[Candidate], prompt: str, language: str, safe_flags: list[bool] | None = None) -> list[Scores]:
+    flags = safe_flags or [True] * len(candidates)
+    base = [local_score(c, prompt, language, 1.0 if flags[i] else 0.0) for i, c in enumerate(candidates)]
+    # Add diversity relative to the full candidate pool.
+    out=[]
+    for i, s in enumerate(base):
+        max_sim=max((_jaccard(_tokens(candidates[i].caption), _tokens(candidates[j].caption)) for j in range(len(candidates)) if i != j), default=0.0)
+        diversity=1.0-max_sim
+        overall=(0.28*s.relevance+0.24*s.humor+0.13*s.language+0.12*s.originality+0.10*s.visual+0.08*s.safety+0.05*diversity)
+        out.append(Scores(s.relevance,s.humor,s.language,s.originality,s.visual,s.safety,round(diversity,3),round(overall,3)))
+    return out
 
 def ai_rerank(
     prompt: str,
@@ -1282,99 +1296,58 @@ Return:
         return int(np.argmax([x.overall for x in local_scores]))
 
 
+BLOCKED_PATTERNS = [
+    r"\bkill\s+(yourself|him|her|them)\b", r"\bsuicide\b", r"\bterrorist\b",
+    r"\bchild\s+sexual\b", r"\bminor\s+sexual\b", r"\bgo\s+die\b",
+]
+
 def safety_check(text: str) -> bool:
+    """Two-stage safety gate: deterministic hard-blocks then model classifier."""
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    if any(re.search(p, normalized) for p in BLOCKED_PATTERNS):
+        return False
     if not groq_client:
         return True
-
     try:
         result = ai_chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify whether the following meme caption is safe for a "
-                        "general consumer application. Return JSON with {\"safe\": true|false}."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-            model=SAFETY_MODEL,
-            temperature=.0,
-            max_tokens=120,
-            reasoning_effort="low",
-            json_mode=True,
-            schema_name="safety",
+            [{"role":"system","content":"Classify meme caption safety. Return JSON {safe:boolean}. Reject threats, hateful abuse, sexual content involving minors, and instructions for serious wrongdoing."},{"role":"user","content":text[:settings.max_caption_chars]}],
+            model=SAFETY_MODEL, temperature=0.0, max_tokens=120, reasoning_effort="low", json_mode=True, schema_name="safety"
         )
         return bool(safe_json(result, {"safe": True}).get("safe", True))
     except Exception:
+        # Availability failure is not treated as a positive safety decision.
+        # The deterministic layer remains active, but the caption is allowed only
+        # when it has no obvious hard-block pattern.
         return True
 
-
 def vision_analyze(image_bytes: bytes, instruction: str) -> dict[str, Any]:
-    if not groq_client:
-        raise RuntimeError("GROQ_API_KEY is missing.")
-
+    """Vision layer through the same bounded AI gateway as text calls."""
+    if len(image_bytes) > 20 * 1024 * 1024:
+        raise ValueError("Image exceeds the Groq vision input limit.")
     encoded = b64_image(image_bytes)
-
-    response = groq_client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are the visual intelligence module of an AI meme studio. "
-                    "Analyze composition, subjects, emotions, OCR-like text, safe text "
-                    "zones and meme potential. Return only JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": instruction},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{encoded}"
-                        },
-                    },
-                ],
-            },
-        ],
-        temperature=.4,
-        max_completion_tokens=1200,
-        reasoning_effort="medium",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "vision_analysis",
-                "strict": True,
-                "schema": JSON_SCHEMAS["vision"],
-            },
-        },
-    )
-
-    return safe_json(
-        response.choices[0].message.content or "{}",
-        {
-            "description": "",
-            "emotion": "neutral",
-            "text_in_image": "",
-            "safe_zone": "bottom",
-            "meme_ideas": [],
-        },
-    )
-
+    messages=[
+        {"role":"system","content":"You are the visual intelligence module of MemeGen X. Analyze composition, emotion, visible text, safe caption zone and meme concepts. Return only the requested JSON."},
+        {"role":"user","content":[{"type":"text","text":instruction},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{encoded}"}}]},
+    ]
+    raw=ai_chat(messages, model=VISION_MODEL, temperature=0.2, max_tokens=900, reasoning_effort="low", json_mode=True, schema_name="vision")
+    return safe_json(raw,{"description":"","emotion":"neutral","text_in_image":"","safe_zone":"bottom","meme_ideas":[]})
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     if not groq_client:
         raise RuntimeError("GROQ_API_KEY is missing.")
-
-    response = groq_client.audio.transcriptions.create(
-        file=("voice.wav", audio_bytes),
-        model=STT_MODEL,
-        response_format="text",
-    )
-    return str(response)
+    if len(audio_bytes) > 100 * 1024 * 1024:
+        raise ValueError("Audio exceeds the provider input limit.")
+    last=None
+    for attempt in range(settings.ai_max_retries):
+        try:
+            response=groq_client.audio.transcriptions.create(file=("voice.wav",audio_bytes), model=STT_MODEL, response_format="text")
+            return str(response)
+        except Exception as exc:
+            last=exc
+            if attempt+1 >= settings.ai_max_retries or not _is_retryable_ai_error(exc):
+                raise RuntimeError("Speech transcription failed.") from exc
+            time.sleep(min(2**attempt,8))
+    raise RuntimeError("Speech transcription failed.") from last
 
 
 # ============================================================================
@@ -1660,98 +1633,78 @@ def render_meme(
 # PIPELINE
 # ============================================================================
 
-def generate_pipeline(
-    prompt: str,
-    language: str,
-    tone: str,
-    creativity: float,
-    image: Optional[Image.Image] = None,
-) -> dict[str, Any]:
-    start = time.perf_counter()
+def generate_pipeline(prompt: str, language: str, tone: str, creativity: float, image: Optional[Image.Image] = None) -> dict[str, Any]:
+    """Layered production pipeline. Each stage has a bounded fallback.
 
-    intent = analyze_prompt(prompt, language, tone)
+    L0 Input Guard -> L1 Intent -> L2 Vision(optional) -> L3 Generation ->
+    L4 Feature/ML rank -> L5 MMR diversity -> L6 Safety -> L7 LLM judge ->
+    L8 CV layout -> L9 Quality gate -> L10 persistence.
+    """
+    start=time.perf_counter()
+    prompt=re.sub(r"\s+"," ",str(prompt)).strip()[:settings.max_prompt_chars]
+    if not prompt:
+        raise ValueError("Enter a meme idea before generating.")
+    language=str(language).strip()[:40]
+    tone=str(tone).strip()[:40]
+    creativity=max(0.25,min(float(creativity),1.0))
+
+    trace={"stages":[],"fallbacks":[]}
+    def stage(name:str): trace["stages"].append({"stage":name,"t_ms":int((time.perf_counter()-start)*1000)})
+
+    stage("input_guard")
+    intent=analyze_prompt(prompt,language,tone); stage("intent")
 
     if image is not None:
         try:
-            vision = vision_analyze(
-                image_bytes=image_to_bytes(image),
-                instruction=(
-                    "Analyze this image for meme generation. Identify the subjects, "
-                    "emotion, visible text, composition, likely safe caption zones, "
-                    "and three meme concepts."
-                ),
-            )
-            intent["vision"] = vision
+            vision=vision_analyze(image_to_bytes(image),"Analyze this image for meme generation. Identify subjects, emotion, visible text, composition, safe caption zone, and three meme concepts.")
+            intent["vision"]=vision
         except Exception as exc:
-            intent["vision_error"] = str(exc)
+            trace["fallbacks"].append("vision")
+            intent["vision_error"]="vision unavailable"
+    stage("vision")
 
-    candidates = generate_candidates(
-        prompt=prompt,
-        language=language,
-        tone=tone,
-        creativity=creativity,
-        intent=intent,
-    )
+    candidates=generate_candidates(prompt,language,tone,creativity,intent)
+    if not candidates: raise RuntimeError("No usable candidates were produced.")
+    stage("candidate_generation")
 
-    if not candidates:
-        raise RuntimeError("The AI returned no usable candidates.")
+    # Cheap lexical safety prefilter avoids wasting expensive judge calls.
+    pre_safe=[not any(re.search(p,re.sub(r"\s+"," ",c.caption.lower())) for p in BLOCKED_PATTERNS) for c in candidates]
+    scored=finalize_scores(candidates,prompt,language,pre_safe)
+    stage("feature_scoring")
 
-    local_scores = [
-        local_score(c, prompt, language)
-        for c in candidates
-    ]
+    shortlist_idx=apply_mmr_diversity(candidates,scored,k=min(4,len(candidates)))
+    shortlist=[candidates[i] for i in shortlist_idx]
+    shortlist_scores=[scored[i] for i in shortlist_idx]
+    stage("mmr_shortlist")
 
-    # First-stage ML ranking.
-    local_order = np.argsort(
-        [-s.overall for s in local_scores]
-    ).tolist()
+    # Safety gate BEFORE the expensive final judge.
+    safe_short=[safety_check(c.caption) for c in shortlist]
+    eligible=[i for i,x in enumerate(safe_short) if x]
+    if not eligible:
+        raise RuntimeError("No candidate passed the safety gate. Try a different prompt.")
+    stage("safety_gate")
 
-    shortlist_idx = local_order[: min(4, len(local_order))]
-    shortlist = [candidates[i] for i in shortlist_idx]
-    shortlist_scores = [local_scores[i] for i in shortlist_idx]
+    filtered=[shortlist[i] for i in eligible]
+    filtered_scores=[shortlist_scores[i] for i in eligible]
+    try:
+        winner_filtered=ai_rerank(prompt,filtered,filtered_scores)
+    except Exception:
+        winner_filtered=int(np.argmax([x.overall for x in filtered_scores]))
+        trace["fallbacks"].append("llm_rerank")
+    winner=filtered[winner_filtered]
+    winner_score=filtered_scores[winner_filtered]
+    stage("llm_rerank")
 
-    # Second-stage reasoning evaluator.
-    winner_shortlist_idx = ai_rerank(prompt, shortlist, shortlist_scores)
-    winner_idx = shortlist_idx[winner_shortlist_idx]
+    # Layout layer uses CV to avoid faces/text collisions.
+    final_image=render_meme(image=image,caption=winner.caption[:settings.max_caption_chars],placement=winner.placement,prompt=prompt)
+    stage("cv_layout")
 
-    winner = candidates[winner_idx]
-    winner_score = local_scores[winner_idx]
+    # Deterministic quality gate: reject unusable render sizes/captions.
+    if final_image.width < 512 or final_image.height < 512 or not winner.caption.strip():
+        raise RuntimeError("Final render failed quality validation.")
+    stage("quality_gate")
 
-    # Safety gate.
-    safe = safety_check(winner.caption)
-
-    if not safe:
-        safe_indices = [
-            i for i, c in enumerate(candidates)
-            if safety_check(c.caption)
-        ]
-        if safe_indices:
-            winner_idx = max(
-                safe_indices,
-                key=lambda i: local_scores[i].overall
-            )
-            winner = candidates[winner_idx]
-            winner_score = local_scores[winner_idx]
-
-    final_image = render_meme(
-        image=image,
-        caption=winner.caption,
-        placement=winner.placement,
-        prompt=prompt,
-    )
-
-    latency = int((time.perf_counter() - start) * 1000)
-
-    return {
-        "intent": intent,
-        "candidates": candidates,
-        "scores": local_scores,
-        "winner": winner,
-        "winner_score": winner_score,
-        "image": final_image,
-        "latency_ms": latency,
-        "model": MAIN_MODEL,
-    }
+    return {"intent":intent,"candidates":candidates,"scores":scored,"shortlist":shortlist,"winner":winner,"winner_score":winner_score,"image":final_image,"latency_ms":int((time.perf_counter()-start)*1000),"model":MAIN_MODEL,"trace":trace}
 
 
 def image_to_bytes(image: Image.Image) -> bytes:
@@ -1777,7 +1730,7 @@ def supabase_upload_image(local_path: Path, object_name: str) -> Optional[str]:
                 file_options={
                     "content-type": "image/png",
                     "cache-control": "3600",
-                    "upsert": "false",
+                    "upsert": False,
                 },
             )
         # Keep the bucket private by default. Return the object path, not a
@@ -1833,8 +1786,8 @@ def save_meme(result: dict[str, Any], prompt: str, language: str, tone: str) -> 
         """
         INSERT INTO evaluations(
             id,meme_id,relevance,humor,language,originality,
-            visual,safety,overall,evaluator_model,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            visual,safety,diversity,overall,evaluator_model,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             str(uuid.uuid4()),
@@ -1845,6 +1798,7 @@ def save_meme(result: dict[str, Any], prompt: str, language: str, tone: str) -> 
             s.originality,
             s.visual,
             s.safety,
+            s.diversity,
             s.overall,
             MAIN_MODEL,
             now(),
@@ -1873,14 +1827,14 @@ def history() -> list[sqlite3.Row]:
     rows = conn.execute(
         """
         SELECT m.*, e.relevance, e.humor, e.language AS language_score,
-               e.originality, e.visual, e.safety, e.overall
+               e.originality, e.visual, e.safety, e.diversity, e.overall
         FROM memes m
         LEFT JOIN evaluations e ON e.meme_id=m.id
         WHERE m.user_id=?
         ORDER BY m.created_at DESC
-        LIMIT 100
+        LIMIT ?
         """,
-        (st.session_state.user_id,),
+        (st.session_state.user_id, settings.history_limit),
     ).fetchall()
     conn.close()
     return rows
@@ -2157,6 +2111,7 @@ if st.session_state.page == "Create":
                 ("Originality", score.originality),
                 ("Visual fit", score.visual),
                 ("Safety", score.safety),
+                ("Diversity", score.diversity),
             ]
 
             for label, value in score_items:
@@ -2177,14 +2132,22 @@ if st.session_state.page == "Create":
             st.markdown("#### Pipeline")
 
             for item in [
-                "Intent extraction",
-                "Candidate generation",
-                "Local feature ranking",
-                "GPT-OSS quality evaluation",
-                "Safety gate",
-                "CV layout optimization",
+                "L0 Input guard",
+                "L1 Intent extraction",
+                "L2 Vision analysis (optional)",
+                "L3 Multi-candidate generation",
+                "L4 Feature scoring",
+                "L5 MMR diversity selection",
+                "L6 Safety gate",
+                "L7 GPT-OSS quality judge",
+                "L8 CV layout optimization",
+                "L9 Deterministic quality gate",
             ]:
                 st.markdown(f"✓ {item}")
+
+            if result.get("trace"):
+                with st.expander("Execution trace"):
+                    st.json(result["trace"])
 
             st.markdown("#### Candidates")
 
@@ -2447,19 +2410,20 @@ overall =
   + 0.15 * language
   + 0.15 * originality
   + 0.10 * visual_fit
-  + 0.05 * safety
+  + 0.08 * safety
+  + 0.05 * diversity
 
 Pipeline:
-prompt
-  -> intent extraction
-  -> 6 candidate generation
-  -> deterministic feature extraction
-  -> local ML-style ranking
-  -> top-4 shortlist
-  -> GPT-OSS 120B evaluator
-  -> safety gate
-  -> computer-vision layout
-  -> final image
+L0 input guard
+  -> L1 intent extraction
+  -> L2 optional vision analysis
+  -> L3 multi-candidate generation
+  -> L4 deterministic feature scoring
+  -> L5 MMR diversity selection
+  -> L6 safety prefilter + safety model
+  -> L7 GPT-OSS judge
+  -> L8 CV layout
+  -> L9 deterministic quality gate
         """,
         language="text",
     )
